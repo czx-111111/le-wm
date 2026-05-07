@@ -1,0 +1,46 @@
+# 数据和模型
+*.h5
+*.ckpt
+*.pt
+*.pth
+data/
+
+# 日志和输出
+*.log
+outputs/
+train.log
+eval.log
+
+# 运行时文件
+tworooms/
+wandb/
+checkpoints/
+le-wm-test/
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+*.egg-info/
+
+# 环境配置（含敏感信息）
+environment*.json
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# 评估结果
+rollout_*.mp4
+*.mp4
+tworoom_results.txt
+"config (1).json"
+
+# 备份和冗余文件
+*_v*.txt
+*.bak
+config (1).json
