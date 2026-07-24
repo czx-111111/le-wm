@@ -1,0 +1,71 @@
+# @package _global_
+defaults:
+  - _self_
+  - data: rope  # 使用 rope 数据集配置
+
+output_model_name: lewm_rope
+subdir: ${hydra:job.id}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+dump_object: True
+
+trainer:
+  max_epochs: 50
+  devices: [4, 5, 6, 7]
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  # 物理 batch 从 16 降到 4，梯度累积从 8 提高到 32
+  # 单卡等效 batch = 4 × 32 = 128（与原来完全一致）
+  # 4 卡全局等效 batch = 128 × 4 = 512（与原来完全一致）
+  accumulate_grad_batches: 32
+
+loader:
+  batch_size: 4                # 物理 batch 降为 4
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+wandb:
+  enabled: True
+  config:
+    entity: derorice_1-taiyuan-university-of-technology
+    project: le-wm-test
+    name: lewm_rope
+    id: ${subdir}
+    resume: allow
+    log_model: False
+
+wm:
+  type: lewm
+  history_size: 3
+  num_preds: 1
+  embed_dim: 192
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024

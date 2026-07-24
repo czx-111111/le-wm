@@ -3,6 +3,7 @@ from functools import partial
 from pathlib import Path
 
 import hydra
+from hydra.utils import instantiate
 import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
@@ -13,7 +14,6 @@ from omegaconf import OmegaConf, open_dict
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
-
 
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
@@ -51,7 +51,7 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    dataset = instantiate(cfg.data.dataset, transform=None)
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
     
     with open_dict(cfg):
@@ -159,6 +159,7 @@ def run(cfg):
     object_dump_callback = ModelObjectCallBack(
         dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
     )
+
 
     trainer = pl.Trainer(
         **cfg.trainer,

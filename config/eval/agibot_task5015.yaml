@@ -1,0 +1,44 @@
+defaults:
+  - launcher: local
+  - solver: cem
+  - _self_
+
+cache_dir: /mnt/data/wangjianfeng/qwh/czx/le-wm/data
+mode: offline
+
+wm:
+  history_size: 3
+  num_preds: 1
+
+dataset:
+  stats: test
+  num_steps: 4
+  frameskip: 5
+  keys_to_load:
+    - pixels
+    - action
+    - proprio
+  keys_to_cache:
+    - action
+    - proprio
+
+seed: 42
+policy: lewm_epoch_49
+
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 5
+
+eval:
+  mode: ${mode}
+  num_eval: 19  # 改为 19（总 episode 数）
+  goal_offset_steps: 100  # 改为 100（确保有足够的起始点）
+  eval_budget: 50
+  img_size: 224
+  dataset_name: test
+  success_ratio: 1.0
+
+output:
+  filename: agibot_task5015_offline_results.txt
+  dir: ./eval_results/agibot_task5015

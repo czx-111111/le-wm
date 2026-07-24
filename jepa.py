@@ -32,6 +32,7 @@ class JEPA(nn.Module):
         """
 
         pixels = info['pixels'].float()
+        print(f'DEBUG encode pixels.shape={pixels.shape}', flush=True)
         b = pixels.size(0)
         pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
         output = self.encoder(pixels, interpolate_pos_encoding=True)
@@ -40,6 +41,8 @@ class JEPA(nn.Module):
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
 
         if "action" in info:
+            print(f"DEBUG encode action.shape: {info['action'].shape}")
+            print(f"DEBUG action_encoder expects channels: {self.action_encoder.patch_embed.in_channels}")
             info["act_emb"] = self.action_encoder(info["action"])
 
         return info
@@ -70,11 +73,18 @@ class JEPA(nn.Module):
         H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
         act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
-        info["action"] = act_0
+        # info["action"] = act_0  # 注释掉，避免修改原始info
         n_steps = T - H
 
         # copy and encode initial info dict
-        _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+        # pixels needs time dim preserved: (B, T, C, H, W) -> (B, 1, C, H, W)
+        _init = {}
+        for k, v in info.items():
+            if torch.is_tensor(v):
+                if k == "pixels":
+                    _init[k] = v[:, :1]  # keep time dim
+                else:
+                    _init[k] = v[:, :1]  # 保留时间维
         _init = self.encode(_init)
         emb = info["emb"] = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
         _init = {k: detach_clone(v) for k, v in _init.items()}
@@ -86,10 +96,14 @@ class JEPA(nn.Module):
 
         # rollout predictor autoregressively for n_steps
         HS = history_size
+        print(f"DEBUG rollout: emb.shape={emb.shape}, act.shape={act.shape}", flush=True)
         for t in range(n_steps):
+            print(f"DEBUG t={t}: emb.shape={emb.shape}, act.shape={act.shape}", flush=True)
             act_emb = self.action_encoder(act)
-            emb_trunc = emb[:, -HS:]  # (BS, HS, D)
-            act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
+            max_len = min(emb.shape[1], act_emb.shape[1], HS)
+            emb_trunc = emb[:, -max_len:]  # (BS, max_len, D)
+            act_trunc = act_emb[:, -max_len:]  # (BS, max_len, A_emb)
+            print(f"DEBUG trunc: max_len={max_len}, emb_trunc.shape={emb_trunc.shape}, act_trunc.shape={act_trunc.shape}", flush=True)
             pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
             emb = torch.cat([emb, pred_emb], dim=1)  # (BS, T+1, D)
 
@@ -98,8 +112,9 @@ class JEPA(nn.Module):
 
         # predict the last state
         act_emb = self.action_encoder(act)  # (BS, T, A_emb)
-        emb_trunc = emb[:, -HS:]  # (BS, HS, D)
-        act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
+        max_len = min(emb.shape[1], act_emb.shape[1], HS)
+        emb_trunc = emb[:, -max_len:]  # (BS, max_len, D)
+        act_trunc = act_emb[:, -max_len:]  # (BS, max_len, A_emb)
         pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
         emb = torch.cat([emb, pred_emb], dim=1)
 
@@ -135,14 +150,22 @@ class JEPA(nn.Module):
             if torch.is_tensor(info_dict[k]):
                 info_dict[k] = info_dict[k].to(device)
 
-        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
-        goal["pixels"] = goal["goal"]
+        print(f'DEBUG info_dict keys: {[k for k in info_dict.keys() if torch.is_tensor(info_dict[k])]}', flush=True)
+        for k, v in info_dict.items():
+            if torch.is_tensor(v):
+                print(f'DEBUG info_dict[{k}].shape={v.shape}', flush=True)
+        # goal is already (B, C, H, W) or (B, D), no time dim to slice
+        goal = {}
+        for k, v in info_dict.items():
+            if torch.is_tensor(v):
+                if k.startswith("goal"):
+                    goal[k.replace("goal_", "")] = v  # (B, C, H, W) -> keep as is
+        goal["pixels"] = goal["goal"].unsqueeze(1)  # (B, C, H, W) -> (B, 1, C, H, W)
+        # goal_proprio -> proprio
+        if "goal_proprio" in info_dict:
+            goal["proprio"] = info_dict["goal_proprio"].unsqueeze(1)  # (B, D) -> (B, 1, D)
 
-        for k in info_dict:
-            if k.startswith("goal_"):
-                goal[k[len("goal_") :]] = goal.pop(k)
-
-        goal.pop("action")
+        goal.pop("action", None)
         goal = self.encode(goal)
 
         info_dict["goal_emb"] = goal["emb"]

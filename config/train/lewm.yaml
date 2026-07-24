@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - data: tworoom
+  - data: agibot_task5015
 
 output_model_name: lewm
 subdir: ${hydra:job.id}
@@ -14,10 +14,10 @@ encoder_scale: tiny
 dump_object: True
 
 trainer:
-  max_epochs: 200
-  devices: auto
+  max_epochs: 50
+  devices: [4,5,6,7]
   accelerator: gpu
-  precision: bf16
+  precision: 32
   gradient_clip_val: 1.0
   log_every_n_steps: 10
 

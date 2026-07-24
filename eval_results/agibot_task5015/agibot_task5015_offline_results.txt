@@ -1,0 +1,48 @@
+
+==== CONFIG ====
+cache_dir: /mnt/data/wangjianfeng/qwh/czx/le-wm/data
+solver:
+  _target_: stable_worldmodel.solver.CEMSolver
+  model: ???
+  batch_size: 1
+  num_samples: 300
+  var_scale: 1.0
+  n_steps: 30
+  topk: 30
+  device: cuda
+  seed: ${seed}
+mode: offline
+wm:
+  history_size: 3
+  num_preds: 1
+dataset:
+  stats: test
+  num_steps: 4
+  frameskip: 5
+  keys_to_load:
+  - pixels
+  - action
+  - proprio
+  keys_to_cache:
+  - action
+  - proprio
+seed: 42
+policy: lewm_epoch_49
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 5
+eval:
+  mode: ${mode}
+  num_eval: 19
+  goal_offset_steps: 100
+  eval_budget: 50
+  img_size: 224
+  dataset_name: test
+  success_ratio: 1.0
+output:
+  filename: agibot_task5015_offline_results.txt
+  dir: ./eval_results/agibot_task5015
+
+==== RESULTS ====
+metrics: {'mode': 'offline', 'num_eval': 19, 'mean_planning_cost': 105.89399839702405, 'mean_expert_cost': 280.2014184249075, 'median_planning_cost': 105.61907196044922, 'success_rate': 100.0, 'evaluation_time_sec': 45.3189218044281}

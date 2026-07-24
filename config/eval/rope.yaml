@@ -1,0 +1,51 @@
+defaults:
+  - launcher: local
+  - solver: cem
+  - _self_
+
+env:
+  CUDA_VISIBLE_DEVICES: 0
+  PYFLEX_HEADLESS: 1
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+
+world:
+  env_name: swm/flex_rope
+  num_envs: 1
+  max_episode_steps: 400
+  history_size: 1
+  frame_skip: 1
+  env_kwargs:
+    object_name: rope
+    headless: true
+
+seed: 42
+policy: /workspace/le-wm/data/lewm_rope_epoch_50
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    - pixels
+    - proprio
+    - goal_proprio
+
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 5
+
+eval:
+  mode: sim
+  num_eval: 50
+  goal_offset_steps: 10
+  eval_budget: 200
+  img_size: 224
+  dataset_name: rope
+  use_flex_env: true
+  success_threshold: 0.02
+  callables:
+    - _set_state
+    - _set_goal_state
+
+output:
+  filename: rope_eval_results.txt
