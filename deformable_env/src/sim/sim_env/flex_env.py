@@ -18,9 +18,27 @@ from .flex_scene import FlexScene
 from .cameras import Camera
 from ..utils import fps_with_idx, quatFromAxisAngle, find_min_distance, rand_float
 
-# flex_env.py 位于 dino_wm-main/env/deformable_env/src/sim/sim_env/
-# 上 5 级到 dino_wm-main（URDF 路径为 env/deformable_env/src/sim/assets/...）
-BASE_DIR = "/workspace/le-wm" #os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../"))
+# flex_env.py: .../deformable_env/src/sim/sim_env/flex_env.py
+# dirname -> sim -> src -> deformable_env -> le-wm 根目录
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
+_PYFLEX_INITIALIZED = False
+
+
+def ensure_pyflex_init(headless=True, screen_width=224, screen_height=224):
+    """只初始化一次；在 torch.cuda 之前调用可避免 Docker 里 segfault。"""
+    global _PYFLEX_INITIALIZED
+    if _PYFLEX_INITIALIZED:
+        print("[FlexEnv] pyflex already initialized, skip")
+        return
+    print(f"[FlexEnv] pyflex.init(headless={headless}) ...")
+    pyflex.set_screenWidth(screen_width)
+    pyflex.set_screenHeight(screen_height)
+    pyflex.set_light_dir(np.array([0.1, 5.0, 0.1]))
+    pyflex.set_light_fov(70.0)
+    pyflex.init(headless)
+    _PYFLEX_INITIALIZED = True
+    print("[FlexEnv] pyflex.init OK")
+
 
 class FlexEnv(gym.Env):
     def __init__(self, config=None) -> None:
@@ -53,13 +71,11 @@ class FlexEnv(gym.Env):
         self.camera = Camera(self.screenWidth, self.screenHeight)
 
         print(f"[FlexEnv] BASE_DIR={BASE_DIR}")
-        print(f"[FlexEnv] pyflex.init(headless={self.dataset_config['headless']}) ...")
-        pyflex.set_screenWidth(self.screenWidth)
-        pyflex.set_screenHeight(self.screenHeight)
-        pyflex.set_light_dir(np.array([0.1, 5.0, 0.1]))
-        pyflex.set_light_fov(70.0)
-        pyflex.init(self.dataset_config["headless"])
-        print("[FlexEnv] pyflex.init OK")
+        ensure_pyflex_init(
+            headless=self.dataset_config["headless"],
+            screen_width=self.screenWidth,
+            screen_height=self.screenHeight,
+        )
 
         # set up camera
         self.camera_view = self.dataset_config["camera_view"]
@@ -166,7 +182,7 @@ class FlexEnv(gym.Env):
             robot_base_orn = [0, 0, 0, 1]
             self.robotId = pyflex.loadURDF(
                 self.flex_robot_helper,
-                os.path.join(BASE_DIR, "env/deformable_env/src/sim/assets/xarm/xarm6_with_gripper_board.urdf"),
+                os.path.join(BASE_DIR, "deformable_env/src/sim/assets/xarm/xarm6_with_gripper_board.urdf"),
                 robot_base_pos,
                 robot_base_orn,
                 globalScaling=10.0,
@@ -178,7 +194,7 @@ class FlexEnv(gym.Env):
             robot_base_orn = [0, 0, 0, 1]
             self.robotId = pyflex.loadURDF(
                 self.flex_robot_helper,
-                os.path.join(BASE_DIR, "env/deformable_env/src/sim/assets/xarm/xarm6_with_gripper.urdf"),
+                os.path.join(BASE_DIR, "deformable_env/src/sim/assets/xarm/xarm6_with_gripper.urdf"),
                 robot_base_pos,
                 robot_base_orn,
                 globalScaling=10.0,
@@ -190,7 +206,7 @@ class FlexEnv(gym.Env):
             robot_base_orn = [0, 0, 0, 1]
             self.robotId = pyflex.loadURDF(
                 self.flex_robot_helper,
-                os.path.join(BASE_DIR, "env/deformable_env/src/sim/assets/xarm/xarm6_with_gripper_grasp.urdf"),
+                os.path.join(BASE_DIR, "deformable_env/src/sim/assets/xarm/xarm6_with_gripper_grasp.urdf"),
                 robot_base_pos,
                 robot_base_orn,
                 globalScaling=10.0,

@@ -8,9 +8,8 @@ import math
 from .src.sim.utils import load_yaml
 
 ENV_ACTION_DIM = 4
-# FlexEnvWrapper.py 位于 dino_wm-main/env/deformable_env/
-# 上两级到 dino_wm-main（内含 conf/ 与 assets）
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+# deformable_env/FlexEnvWrapper.py -> 上一级即 le-wm 根目录（含 conf/）
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def aggregate_dct(dcts):
