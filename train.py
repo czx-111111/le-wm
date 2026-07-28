@@ -157,7 +157,9 @@ def run(cfg):
         OmegaConf.save(cfg, f)
 
     object_dump_callback = ModelObjectCallBack(
-        dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
+        dirpath=run_dir,
+        filename=cfg.output_model_name,
+        epoch_interval=int(cfg.get("save_object_every_n_epochs", 1)),
     )
 
 

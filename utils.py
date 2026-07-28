@@ -4,6 +4,23 @@ from pathlib import Path
 from stable_pretraining import data as dt
 from lightning.pytorch.callbacks import Callback
 
+
+def aggregate_dct(dcts):
+    """Stack a list of dicts into a dict of stacked arrays/tensors."""
+    full_dct = {}
+    for dct in dcts:
+        for key, value in dct.items():
+            if key not in full_dct:
+                full_dct[key] = []
+            full_dct[key].append(value)
+    for key, value in full_dct.items():
+        if isinstance(value[0], torch.Tensor):
+            full_dct[key] = torch.stack(value)
+        else:
+            full_dct[key] = np.stack(value)
+    return full_dct
+
+
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     imagenet_stats = dt.dataset_stats.ImageNet
     to_image = dt.transforms.ToImage(**imagenet_stats, source=source, target=target)

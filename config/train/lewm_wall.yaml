@@ -1,0 +1,77 @@
+# @package _global_
+defaults:
+  - _self_
+  # 这里是 config/train/data/wall.yaml，不是 hdf5 名
+  - data: wall
+
+# 从头训练 wall；新名字避免自动加载旧 ckpt
+output_model_name: lewm_wall_v1
+subdir: ""
+
+num_workers: 4
+# 仅在 wall_train.h5 内部再切 train/val；与 wall_eval.h5 完全分离
+train_split: 0.9
+seed: 3072
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+dump_object: True
+# 完整模型 object 每 N 个 epoch 存一次（最后一轮仍会存）
+save_object_every_n_epochs: 10
+
+trainer:
+  max_epochs: 100
+  devices: [1, 2]
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  # 全局等效 batch = 16 × 4 × 2卡 = 128
+  accumulate_grad_batches: 4
+
+loader:
+  batch_size: 16
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5.0e-5
+  weight_decay: 1.0e-3
+
+wandb:
+  enabled: True
+  config:
+    entity: derorice_1-taiyuan-university-of-technology
+    project: le-wm-test
+    name: lewm_wall_v1_scratch
+    id: lewm_wall_v1_scratch
+    resume: allow
+    log_model: False
+
+wm:
+  type: lewm
+  history_size: 3
+  num_preds: 1
+  embed_dim: 192
+  # DINO-WM wall_single 的 action 为 2 维
+  action_dim: 2
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+loss:
+  sigreg:
+    weight: 0.05
+    kwargs:
+      knots: 17
+      num_proj: 1024
