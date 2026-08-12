@@ -3,9 +3,9 @@ defaults:
   - _self_
   - data: rope
 
-# 从头训练（看 LeWM rope 上限）：新名字，避免自动加载旧 lewm_rope_weights.ckpt
-output_model_name: lewm_rope_v2
-subdir: ""
+# rope v3
+output_model_name: lewm_rope_v3
+subdir: ${output_model_name}_${now:%Y%m%d_%H%M%S}
 
 num_workers: 4
 train_split: 0.9
@@ -14,19 +14,23 @@ img_size: 224
 patch_size: 14
 encoder_scale: tiny
 dump_object: True
-# 完整模型 object 每 N 个 epoch 存一次（最后一轮仍会存）
+# 更勤存，便于躲开 val 尖峰选 best
 save_object_every_n_epochs: 10
+
+checkpoint:
+  monitor: validate/pred_loss
+  mode: min
+  save_top_k: 1
 
 trainer:
   max_epochs: 100
   devices: [5, 6]
   accelerator: gpu
   strategy: ddp
-  precision: bf16
+  precision: bf16-mixed
   gradient_clip_val: 1.0
   log_every_n_steps: 10
   check_val_every_n_epoch: 1
-  # 全局等效 batch = 16 × 4 × 2卡 = 128（卡数减半，累积加倍以保持等效 batch）
   accumulate_grad_batches: 4
 
 loader:
@@ -38,7 +42,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 5.0e-5
+  lr: 3.0e-5
   weight_decay: 1.0e-3
 
 wandb:
@@ -46,9 +50,9 @@ wandb:
   config:
     entity: derorice_1-taiyuan-university-of-technology
     project: le-wm-test
-    name: lewm_rope_v2_scratch
-    id: lewm_rope_v2_scratch
-    resume: allow
+    name: ${subdir}
+    id: ${subdir}
+    resume: never
     log_model: False
 
 wm:
@@ -68,7 +72,7 @@ predictor:
 
 loss:
   sigreg:
-    weight: 0.05
+    weight: 0.09
     kwargs:
       knots: 17
       num_proj: 1024

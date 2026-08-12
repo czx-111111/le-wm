@@ -4,9 +4,9 @@ defaults:
   # 这里是 config/train/data/point_maze.yaml，不是 hdf5 名
   - data: point_maze
 
-# 从头训练 point_maze；新名字避免自动加载旧 ckpt
+# 每次新跑用时间戳子目录 + 独立 wandb run，避免覆盖旧结果
 output_model_name: lewm_point_maze_v2
-subdir: ""
+subdir: ${output_model_name}_${now:%Y%m%d_%H%M%S}
 
 num_workers: 4
 # 仅在 point_maze_train.h5 内部再切 train/val；与 point_maze_eval.h5 完全分离
@@ -16,15 +16,20 @@ img_size: 224
 patch_size: 14
 encoder_scale: tiny
 dump_object: True
-# 完整模型 object 每 N 个 epoch 存一次（最后一轮仍会存）
+# 完整模型 object 每 N 个 epoch 存一次（最后一轮仍会存）；最优另存 *_best_object.ckpt
 save_object_every_n_epochs: 10
+
+checkpoint:
+  monitor: validate/pred_loss
+  mode: min
+  save_top_k: 1
 
 trainer:
   max_epochs: 100
   devices: [5, 6]
   accelerator: gpu
   strategy: ddp
-  precision: bf16
+  precision: bf16-mixed
   gradient_clip_val: 1.0
   log_every_n_steps: 10
   check_val_every_n_epoch: 1
@@ -48,9 +53,9 @@ wandb:
   config:
     entity: derorice_1-taiyuan-university-of-technology
     project: le-wm-test
-    name: lewm_point_maze_v2_scratch
-    id: lewm_point_maze_v2_scratch
-    resume: allow
+    name: ${subdir}
+    id: ${subdir}
+    resume: never
     log_model: False
 
 wm:

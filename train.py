@@ -11,6 +11,8 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
+from lightning.pytorch.callbacks import ModelCheckpoint
+
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
@@ -42,11 +44,13 @@ def lejepa_forward(self, batch, stage, cfg):
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    self.log_dict(losses_dict, on_step=True, on_epoch=True, sync_dist=True)
     return output
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
+    pl.seed_everything(int(cfg.seed), workers=True)
+
     #########################
     ##       dataset       ##
     #########################
@@ -156,16 +160,32 @@ def run(cfg):
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
 
+    ckpt_cfg = cfg.get("checkpoint") or {}
+    monitor = str(ckpt_cfg.get("monitor", "validate/pred_loss"))
+    mode = str(ckpt_cfg.get("mode", "min"))
+    save_top_k = int(ckpt_cfg.get("save_top_k", 1))
+
     object_dump_callback = ModelObjectCallBack(
         dirpath=run_dir,
         filename=cfg.output_model_name,
         epoch_interval=int(cfg.get("save_object_every_n_epochs", 1)),
+        monitor=monitor,
+        mode=mode,
     )
 
+    best_ckpt_callback = ModelCheckpoint(
+        dirpath=run_dir,
+        filename=f"{cfg.output_model_name}_best",
+        monitor=monitor,
+        mode=mode,
+        save_top_k=save_top_k,
+        save_last=True,
+        auto_insert_metric_name=False,
+    )
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=[object_dump_callback, best_ckpt_callback],
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,

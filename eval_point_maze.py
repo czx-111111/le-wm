@@ -7,6 +7,8 @@ LeWM PointMaze 仿真评估（DINO-WM PointMaze）
 评估条数：默认 50（对齐 plan_point_maze.yaml 的 n_evals=50）。
 默认规划卡：物理 GPU 7。
 
+默认 planner=mpc（滚动规划）；--planner openloop 可复现旧开环 CEM。
+
 用法:
   # 首次 / mujoco_py 有问题时:
   #   pip install 'cython==0.29.37'
@@ -15,8 +17,8 @@ LeWM PointMaze 仿真评估（DINO-WM PointMaze）
   # 也可: source setup_env.sh  （会 export LD_LIBRARY_PATH）
   python eval_point_maze.py \\
     --dataset ./data/point_maze_eval.h5 \\
-    --ckpt ./data/lewm_point_maze_v2_weights.ckpt \\
-    --plan-gpu 7 --num-eval 50
+    --ckpt ./data/lewm_point_maze_v2_epoch_30_object.ckpt \\
+    --plan-gpu 7 --num-eval 50 --planner mpc
 """
 from __future__ import annotations
 
@@ -222,6 +224,13 @@ from torchvision.transforms import v2 as transforms
 import stable_pretraining as spt
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP
+from utils import load_lewm_weights_into_model
+from eval_mpc_utils import (
+    as_numpy,
+    extract_macro_frames,
+    stack_history_clip,
+    to_hwc_uint8_compatible,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -515,69 +524,55 @@ def load_lewm_model(
     predictor_dropout: float = 0.1,
     predictor_emb_dropout: float = 0.0,
 ):
-    encoder = spt.backbone.utils.vit_hf(
-        encoder_scale,
-        patch_size=patch_size,
-        image_size=img_size,
-        pretrained=False,
-        use_mask_token=False,
-    )
-    hidden_dim = encoder.config.hidden_size
-
-    predictor = ARPredictor(
-        num_frames=history_size,
-        input_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        output_dim=hidden_dim,
-        depth=predictor_depth,
-        heads=predictor_heads,
-        mlp_dim=predictor_mlp_dim,
-        dim_head=predictor_dim_head,
-        dropout=predictor_dropout,
-        emb_dropout=predictor_emb_dropout,
-    )
-
-    action_encoder = Embedder(
-        input_dim=action_dim,
-        smoothed_dim=smoothed_dim,
-        emb_dim=embed_dim,
-    )
-
-    projector = MLP(
-        input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d
-    )
-    predictor_proj = MLP(
-        input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d
-    )
-
-    model = JEPA(
-        encoder=encoder,
-        predictor=predictor,
-        action_encoder=action_encoder,
-        projector=projector,
-        pred_proj=predictor_proj,
-    )
-
+    # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint.get("state_dict", checkpoint)
-
-    model_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("model."):
-            model_state_dict[k[6:]] = v
-        elif k.startswith("module.model."):
-            model_state_dict[k[13:]] = v
-        else:
-            model_state_dict[k] = v
-
-    result = model.load_state_dict(model_state_dict, strict=False)
-    if result.missing_keys:
-        print(f"[WARN] Missing keys ({len(result.missing_keys)}): {result.missing_keys[:8]}...")
-    if result.unexpected_keys:
-        print(
-            f"[WARN] Unexpected keys ({len(result.unexpected_keys)}): "
-            f"{result.unexpected_keys[:8]}..."
+    if isinstance(checkpoint, nn.Module):
+        model = checkpoint
+        print(f"[INFO] loaded pickled JEPA object from {ckpt_path}")
+    else:
+        encoder = spt.backbone.utils.vit_hf(
+            encoder_scale,
+            patch_size=patch_size,
+            image_size=img_size,
+            pretrained=False,
+            use_mask_token=False,
         )
+        hidden_dim = encoder.config.hidden_size
+
+        predictor = ARPredictor(
+            num_frames=history_size,
+            input_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            depth=predictor_depth,
+            heads=predictor_heads,
+            mlp_dim=predictor_mlp_dim,
+            dim_head=predictor_dim_head,
+            dropout=predictor_dropout,
+            emb_dropout=predictor_emb_dropout,
+        )
+
+        action_encoder = Embedder(
+            input_dim=action_dim,
+            smoothed_dim=smoothed_dim,
+            emb_dim=embed_dim,
+        )
+
+        projector = MLP(
+            input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d
+        )
+        predictor_proj = MLP(
+            input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d
+        )
+
+        model = JEPA(
+            encoder=encoder,
+            predictor=predictor,
+            action_encoder=action_encoder,
+            projector=projector,
+            pred_proj=predictor_proj,
+        )
+        model = load_lewm_weights_into_model(model, ckpt_path)
 
     w = model.action_encoder.patch_embed.weight
     print(
@@ -719,6 +714,109 @@ def run_sim_episode(env, init_state, goal_state, actions, seed: int):
     }
 
 
+def run_mpc_episode(
+    model,
+    env,
+    *,
+    init_clip: dict,
+    init_state,
+    goal_state,
+    goal_pixels,
+    goal_proprio,
+    process: dict,
+    transform: dict,
+    history_size: int,
+    frameskip: int,
+    action_dim: int,
+    horizon: int,
+    n_taken_actions: int,
+    mpc_max_iters: int,
+    cem_kwargs: dict,
+    device: str,
+    seed: int,
+):
+    """MPC: CEM plan → execute n_taken macros → replan from env feedback."""
+    effective_act_dim = frameskip * action_dim
+    init = np.asarray(init_state, dtype=np.float32).reshape(-1)
+    env.prepare(seed, init)
+
+    pixels_np = as_numpy(init_clip["pixels"])
+    proprio_np = as_numpy(init_clip["proprio"])
+    hist_pixels = [to_hwc_uint8_compatible(pixels_np[i]) for i in range(history_size)]
+    hist_proprio = [np.asarray(proprio_np[i], dtype=np.float32).reshape(-1) for i in range(history_size)]
+    hist_act_raw = np.asarray(init_clip["action_raw"], dtype=np.float32).reshape(-1, action_dim)
+
+    goal = np.asarray(goal_state, dtype=np.float32).reshape(-1)
+    final_state = init.copy()
+    plan_costs = []
+    n_mpc_iters = 0
+    success = False
+    state_dist = float(env.eval_state(goal, final_state)["state_dist"])
+
+    for it in range(mpc_max_iters):
+        cur_metrics = env.eval_state(goal, final_state)
+        state_dist = float(cur_metrics["state_dist"])
+        if cur_metrics["success"]:
+            success = True
+            print(f"  [MPC] early success at iter={it}", flush=True)
+            break
+
+        clip = stack_history_clip(
+            hist_pixels, hist_proprio, hist_act_raw, history_size, frameskip, action_dim
+        )
+        clip["action"] = normalize_concat_actions(
+            clip["action_raw"], process, history_size, frameskip, action_dim
+        )
+        info = build_info_dict(clip, goal_pixels, goal_proprio, process, transform)
+        planned_norm, plan_cost = cem_plan(
+            model,
+            info,
+            horizon=horizon,
+            action_dim=effective_act_dim,
+            device=device,
+            **cem_kwargs,
+        )
+        plan_costs.append(float(plan_cost))
+        n_mpc_iters = it + 1
+
+        planned = planned_norm.detach().cpu().numpy()
+        n_take = min(int(n_taken_actions), int(planned.shape[0]))
+        env_actions = denormalize_concat_actions(
+            planned[:n_take], process, frameskip, action_dim
+        )
+        print(
+            f"  [MPC {it + 1}/{mpc_max_iters}] cost={plan_cost:.4f} "
+            f"take={n_take} raw_steps={env_actions.shape[0]} dist={state_dist:.4f}",
+            flush=True,
+        )
+
+        act_list = [a for a in np.asarray(env_actions, dtype=np.float32).reshape(-1, 2)]
+        obses, _, _, infos = env.step_multiple(act_list)
+
+        new_pixels, new_proprio = extract_macro_frames(obses, n_take, frameskip)
+        hist_act_raw = np.concatenate([hist_act_raw, env_actions], axis=0)
+        need = history_size * frameskip
+        hist_act_raw = hist_act_raw[-need:]
+        hist_pixels = (hist_pixels + new_pixels)[-history_size:]
+        hist_proprio = (hist_proprio + new_proprio)[-history_size:]
+
+        final_state = as_numpy(infos["state"][-1]).astype(np.float32).reshape(-1)
+        m = env.eval_state(goal, final_state)
+        state_dist = float(m["state_dist"])
+        success = bool(m["success"])
+        if success:
+            print(f"  [MPC] success after iter={it + 1}", flush=True)
+            break
+
+    return {
+        "success": success,
+        "state_dist": state_dist,
+        "final_state": final_state,
+        "plan_cost": float(np.mean(plan_costs)) if plan_costs else -1.0,
+        "mpc_iters": n_mpc_iters,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -738,6 +836,10 @@ def evaluate(args):
         f"[INFO] action_dim={args.action_dim} frameskip={args.frameskip} "
         f"effective_act_dim={effective_act_dim} history={args.history_size} "
         f"horizon={args.horizon} goal_offset={args.goal_offset} num_eval={args.num_eval}"
+    )
+    print(
+        f"[INFO] planner={args.planner} n_taken={args.n_taken_actions} "
+        f"mpc_max_iters={args.mpc_max_iters}"
     )
     print("[INFO] success: ||goal[:2]-cur[:2]|| < 0.5 （对齐 DINO-WM）")
 
@@ -812,55 +914,85 @@ def evaluate(args):
             args.action_dim,
         )
 
-        info = build_info_dict(
-            clip,
-            goal_fr["pixels"],
-            goal_fr["proprio"],
-            process,
-            transform,
-        )
-        planned_norm, plan_cost = cem_plan(
-            model,
-            info,
-            horizon=args.horizon,
-            action_dim=effective_act_dim,
+        cem_kwargs = dict(
             num_samples=args.cem_num_samples,
             n_steps=args.cem_n_steps,
             topk=args.cem_topk,
             var_scale=args.cem_var_scale,
-            device=device,
-        )
-        env_actions = denormalize_concat_actions(
-            planned_norm.detach().cpu().numpy(),
-            process,
-            args.frameskip,
-            args.action_dim,
-        )
-        print(
-            f"  plan_cost={plan_cost:.4f} env_actions={env_actions.shape}",
-            flush=True,
         )
 
-        sim = run_sim_episode(
-            env,
-            init_state=start_fr["state"],
-            goal_state=goal_fr["state"],
-            actions=env_actions,
-            seed=args.seed + i,
-        )
+        if args.planner == "mpc":
+            sim = run_mpc_episode(
+                model,
+                env,
+                init_clip=clip,
+                init_state=start_fr["state"],
+                goal_state=goal_fr["state"],
+                goal_pixels=goal_fr["pixels"],
+                goal_proprio=goal_fr["proprio"],
+                process=process,
+                transform=transform,
+                history_size=args.history_size,
+                frameskip=args.frameskip,
+                action_dim=args.action_dim,
+                horizon=args.horizon,
+                n_taken_actions=args.n_taken_actions,
+                mpc_max_iters=args.mpc_max_iters,
+                cem_kwargs=cem_kwargs,
+                device=device,
+                seed=args.seed + i,
+            )
+            plan_cost = sim["plan_cost"]
+            print(f"  mpc_iters={sim['mpc_iters']}", flush=True)
+        else:
+            info = build_info_dict(
+                clip,
+                goal_fr["pixels"],
+                goal_fr["proprio"],
+                process,
+                transform,
+            )
+            planned_norm, plan_cost = cem_plan(
+                model,
+                info,
+                horizon=args.horizon,
+                action_dim=effective_act_dim,
+                device=device,
+                **cem_kwargs,
+            )
+            env_actions = denormalize_concat_actions(
+                planned_norm.detach().cpu().numpy(),
+                process,
+                args.frameskip,
+                args.action_dim,
+            )
+            print(
+                f"  plan_cost={plan_cost:.4f} env_actions={env_actions.shape}",
+                flush=True,
+            )
+            sim = run_sim_episode(
+                env,
+                init_state=start_fr["state"],
+                goal_state=goal_fr["state"],
+                actions=env_actions,
+                seed=args.seed + i,
+            )
+
         successes.append(sim["success"])
         dists.append(sim["state_dist"])
         costs.append(float(plan_cost))
-        details.append(
-            {
-                "ep_id": int(ep_id),
-                "start_step": int(start_step),
-                "goal_step": goal_step,
-                "success": sim["success"],
-                "state_dist": sim["state_dist"],
-                "plan_cost": float(plan_cost),
-            }
-        )
+        detail = {
+            "ep_id": int(ep_id),
+            "start_step": int(start_step),
+            "goal_step": goal_step,
+            "success": sim["success"],
+            "state_dist": sim["state_dist"],
+            "plan_cost": float(plan_cost),
+            "planner": args.planner,
+        }
+        if args.planner == "mpc":
+            detail["mpc_iters"] = sim.get("mpc_iters", -1)
+        details.append(detail)
         print(
             f"  state_dist={sim['state_dist']:.4f} success={sim['success']}",
             flush=True,
@@ -881,6 +1013,9 @@ def evaluate(args):
         "horizon": args.horizon,
         "goal_offset": args.goal_offset,
         "history_size": args.history_size,
+        "planner": args.planner,
+        "n_taken_actions": args.n_taken_actions if args.planner == "mpc" else None,
+        "mpc_max_iters": args.mpc_max_iters if args.planner == "mpc" else None,
     }
     return metrics, details
 
@@ -920,6 +1055,24 @@ def parse_args():
     p.add_argument("--cem-n-steps", type=int, default=10)
     p.add_argument("--cem-topk", type=int, default=30)
     p.add_argument("--cem-var-scale", type=float, default=1.0)
+    p.add_argument(
+        "--planner",
+        choices=["mpc", "openloop"],
+        default="mpc",
+        help="mpc=滚动规划（默认）；openloop=旧开环 CEM",
+    )
+    p.add_argument(
+        "--n-taken-actions",
+        type=int,
+        default=5,
+        help="MPC 每轮执行的 macro action 数（对齐 DINO n_taken_actions=5）",
+    )
+    p.add_argument(
+        "--mpc-max-iters",
+        type=int,
+        default=5,
+        help="MPC 最大重规划轮数；成功则提前停",
+    )
     p.add_argument(
         "--plan-gpu",
         type=str,

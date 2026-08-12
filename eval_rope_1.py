@@ -4,14 +4,15 @@ LeWM Rope 仿真评估（DINO-WM FlexEnv / PyFleX）
 
 PyTorch CUDA 与 PyFleX 不能共用同一张物理 GPU。
 默认: PLAN_GPU=4 做 CEM，EGL_GPU=5 做 Flex（子进程）。
+协议：goal_offset 须与 horizon 对齐（默认均为 5，对齐 DINO goal_H）。
 
 用法:
   source setup_env.sh
   export PLAN_GPU=4 EGL_GPU=5
 
-  # 一键（规划卡≠仿真卡）
+  # 一键（规划卡≠仿真卡；goal_offset=horizon=5）
   python eval_rope_1.py --dataset ./data/rope_eval.h5 --ckpt ./data/lewm_rope_weights.ckpt \\
-      --plan-gpu 4 --egl-gpu 5 --num-eval 2 --plan-device cuda
+      --plan-gpu 4 --egl-gpu 5 --num-eval 2 --goal-offset 5 --horizon 5 --plan-device cuda
 
   # 若仍 segfault，用两步法（父进程必须完全退出后再仿真）:
   python eval_rope_1.py --dataset ./data/rope_eval.h5 --ckpt ./data/lewm_rope_weights.ckpt \\
@@ -107,6 +108,7 @@ from torchvision.transforms import v2 as transforms
 import stable_pretraining as spt
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP
+from utils import load_lewm_weights_into_model
 
 
 def chamfer_distance(x, y):
@@ -374,63 +376,52 @@ def load_lewm_model(
     predictor_dropout: float = 0.1,
     predictor_emb_dropout: float = 0.0,
 ):
-    encoder = spt.backbone.utils.vit_hf(
-        encoder_scale,
-        patch_size=patch_size,
-        image_size=img_size,
-        pretrained=False,
-        use_mask_token=False,
-    )
-    hidden_dim = encoder.config.hidden_size
-
-    predictor = ARPredictor(
-        num_frames=history_size,
-        input_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        output_dim=hidden_dim,
-        depth=predictor_depth,
-        heads=predictor_heads,
-        mlp_dim=predictor_mlp_dim,
-        dim_head=predictor_dim_head,
-        dropout=predictor_dropout,
-        emb_dropout=predictor_emb_dropout,
-    )
-
-    action_encoder = Embedder(
-        input_dim=action_dim,
-        smoothed_dim=smoothed_dim,
-        emb_dim=embed_dim,
-        mlp_scale=4,
-    )
-
-    projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d)
-    predictor_proj = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d)
-
-    model = JEPA(
-        encoder=encoder,
-        predictor=predictor,
-        action_encoder=action_encoder,
-        projector=projector,
-        pred_proj=predictor_proj,
-    )
-
+    # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint.get("state_dict", checkpoint)
+    if isinstance(checkpoint, nn.Module):
+        model = checkpoint
+        print(f"[INFO] loaded pickled JEPA object from {ckpt_path}")
+    else:
+        encoder = spt.backbone.utils.vit_hf(
+            encoder_scale,
+            patch_size=patch_size,
+            image_size=img_size,
+            pretrained=False,
+            use_mask_token=False,
+        )
+        hidden_dim = encoder.config.hidden_size
 
-    model_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("model."):
-            model_state_dict[k[6:]] = v
-        elif k.startswith("module.model."):
-            model_state_dict[k[13:]] = v
-        else:
-            model_state_dict[k] = v
+        predictor = ARPredictor(
+            num_frames=history_size,
+            input_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            depth=predictor_depth,
+            heads=predictor_heads,
+            mlp_dim=predictor_mlp_dim,
+            dim_head=predictor_dim_head,
+            dropout=predictor_dropout,
+            emb_dropout=predictor_emb_dropout,
+        )
 
-    result = model.load_state_dict(model_state_dict, strict=False)
-    if result.missing_keys:
-        print(f"[WARN] Missing keys ({len(result.missing_keys)}): {result.missing_keys[:8]}...")
-    if result.unexpected_keys:
-        print(f"[WARN] Unexpected keys ({len(result.unexpected_keys)}): {result.unexpected_keys[:8]}...")
+        action_encoder = Embedder(
+            input_dim=action_dim,
+            smoothed_dim=smoothed_dim,
+            emb_dim=embed_dim,
+            mlp_scale=4,
+        )
+
+        projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d)
+        predictor_proj = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d)
+
+        model = JEPA(
+            encoder=encoder,
+            predictor=predictor,
+            action_encoder=action_encoder,
+            projector=projector,
+            pred_proj=predictor_proj,
+        )
+        model = load_lewm_weights_into_model(model, ckpt_path)
 
     w = model.action_encoder.patch_embed.weight
     print(f"[INFO] action_encoder.patch_embed.weight = {tuple(w.shape)} (期望 {(smoothed_dim, action_dim, 1)})")
@@ -458,7 +449,7 @@ def plan_episodes(
     transform,
     device,
     num_eval: int = 50,
-    goal_offset_steps: int = 15,
+    goal_offset_steps: int = 5,
     horizon: int = 5,
     history_size: int = 3,
     action_dim: int = 4,
@@ -637,7 +628,12 @@ def parse_args():
     p.add_argument("--dataset", default="./data/rope_eval.h5")
     p.add_argument("--ckpt", default="./data/lewm_rope_weights.ckpt")
     p.add_argument("--num-eval", type=int, default=50)
-    p.add_argument("--goal-offset", type=int, default=15)
+    p.add_argument(
+        "--goal-offset",
+        type=int,
+        default=5,
+        help="目标相对 start 的步数；须与 --horizon 对齐（DINO goal_H=horizon=5）",
+    )
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--history-size", type=int, default=3)
     p.add_argument("--action-dim", type=int, default=4)

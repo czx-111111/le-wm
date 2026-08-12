@@ -4,27 +4,24 @@ LeWM Granular 仿真评估（DINO-WM FlexEnv / PyFleX）
 
 PyTorch CUDA 与 PyFleX 不能共用同一张物理 GPU。
 可用卡: 3,4,5,6,7。默认 PLAN_GPU=3（CEM），EGL_GPU=4（Flex 子进程）。
+协议：goal_offset 须与 horizon 对齐（默认均为 5）。
+
+默认 planner=mpc（滚动规划；对齐 Wall 的 n_taken=3 / max_iters=8）。
+--planner openloop 复现旧开环 CEM。
 
 用法:
   source setup_env.sh
 
-  # 一键（规划卡 ≠ 仿真卡）
+  # MPC（推荐；用最终轮 object / weights，不用 Ep50）
   python eval_granular.py \\
     --dataset ./data/granular_eval.h5 \\
-    --ckpt ./data/lewm_granular_v1_weights.ckpt \\
-    --plan-gpu 3 --egl-gpu 4 --num-eval 10 --plan-device cuda
+    --ckpt ./data/lewm_granular_v1_epoch_100_object.ckpt \\
+    --plan-gpu 3 --egl-gpu 4 --num-eval 50 \\
+    --planner mpc --n-taken-actions 3 --mpc-max-iters 8 \\
+    --goal-offset 5 --horizon 5 --plan-device cuda
 
-  # 若子进程 segfault，用两步法（父进程完全退出后再仿真）:
-  python eval_granular.py \\
-    --dataset ./data/granular_eval.h5 \\
-    --ckpt ./data/lewm_granular_v1_weights.ckpt \\
-    --plan-gpu 3 --egl-gpu 4 --num-eval 10 --plan-device cuda \\
-    --plan-only --plans-out ./outputs/granular_plans.pkl
-  unset CUDA_VISIBLE_DEVICES
-  export EGL_GPU=4
-  python eval_granular_sim_worker.py \\
-    --plans ./outputs/granular_plans.pkl \\
-    --output ./outputs/granular_metrics.json --success-threshold 1.0
+  # 开环对照
+  python eval_granular.py ... --planner openloop
 """
 from __future__ import annotations
 
@@ -32,13 +29,16 @@ import argparse
 import json
 import os
 import pickle
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent
 
-# 默认可用卡对：规划 3 / 仿真 4（必须不同）
 _DEFAULT_PLAN_GPU = "3"
 _DEFAULT_EGL_GPU = "4"
 
@@ -59,7 +59,6 @@ def _early_apply_gpu_argv():
             plan_gpu = a.split("=", 1)[1]
 
     if plan_gpu == egl_gpu:
-        # 同卡会 segfault；自动换一张可用卡
         alts = [g for g in ("3", "4", "5", "6", "7") if g != egl_gpu]
         plan_gpu = alts[0] if alts else ("0" if egl_gpu != "0" else "1")
         print(
@@ -74,21 +73,125 @@ def _early_apply_gpu_argv():
 
 _early_apply_gpu_argv()
 
-# 复用 rope 评估里的 CEM / 模型加载逻辑（import 时会再跑一遍 GPU setup，沿用上面的环境变量）
+from eval_mpc_utils import to_hwc_uint8_compatible  # noqa: E402
 from eval_rope_1 import (  # noqa: E402
+    build_goal_lookup,
+    build_info_dict,
     build_processors,
+    cem_plan,
+    denormalize_actions,
     img_transform,
+    load_frame,
     load_lewm_model,
+    load_sequence,
     plan_episodes,
     release_torch_cuda,
+    sample_eval_points,
+    to_particle_state,
 )
 
 
-def run_sim_subprocess(plans, success_threshold: float) -> dict:
-    """在全新子进程中跑 Flex（granular）；子进程独占 EGL_GPU。"""
-    import subprocess
-    import tempfile
+def chamfer_distance_np(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)[:, :3]
+    y = np.asarray(y, dtype=np.float64)[:, :3]
+    d = np.linalg.norm(x[:, None, :] - y[None, :, :], axis=-1)
+    return float(d.min(axis=1).mean() + d.min(axis=0).mean())
 
+
+def _atomic_write_pickle(path: Path, obj) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+
+class FlexMpcClient:
+    """与 eval_granular_mpc_worker.py 通信的常驻 Flex 客户端。"""
+
+    def __init__(self, egl_gpu: str, object_name: str = "granular", timeout: float = 600.0):
+        self.egl_gpu = str(egl_gpu)
+        self.object_name = object_name
+        self.timeout = timeout
+        self.ipc = Path(tempfile.mkdtemp(prefix="granular_mpc_ipc_"))
+        self.req_path = self.ipc / "request.pkl"
+        self.resp_path = self.ipc / "response.pkl"
+        self.ready_path = self.ipc / "ready.pkl"
+        for p in (self.req_path, self.resp_path, self.ready_path):
+            if p.exists():
+                p.unlink()
+
+        env = os.environ.copy()
+        env["EGL_GPU"] = self.egl_gpu
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        cmd = [
+            sys.executable,
+            str(ROOT / "eval_granular_mpc_worker.py"),
+            "--ipc-dir",
+            str(self.ipc),
+            "--object-name",
+            self.object_name,
+        ]
+        print(
+            f"[INFO] 启动 MPC Flex worker EGL_GPU={self.egl_gpu} ipc={self.ipc}",
+            flush=True,
+        )
+        self.proc = subprocess.Popen(cmd, env=env)
+        self._wait_path(self.ready_path, label="worker ready")
+
+    def _wait_path(self, path: Path, label: str = "file"):
+        t0 = time.time()
+        while not path.exists():
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"MPC worker 已退出 (code={self.proc.returncode})，等待 {label} 失败"
+                )
+            if time.time() - t0 > self.timeout:
+                raise TimeoutError(f"等待 {label} 超时 ({self.timeout}s): {path}")
+            time.sleep(0.02)
+
+    def _call(self, req: dict) -> dict:
+        if self.resp_path.exists():
+            self.resp_path.unlink()
+        _atomic_write_pickle(self.req_path, req)
+        self._wait_path(self.resp_path, label=f"response for cmd={req.get('cmd')}")
+        time.sleep(0.02)
+        with open(self.resp_path, "rb") as f:
+            resp = pickle.load(f)
+        try:
+            self.resp_path.unlink()
+        except OSError:
+            pass
+        if not resp.get("ok", False):
+            raise RuntimeError(f"MPC worker error: {resp.get('error')}")
+        return resp
+
+    def prepare(self, seed: int, init_state) -> dict:
+        return self._call(
+            {
+                "cmd": "prepare",
+                "seed": int(seed),
+                "init_state": np.asarray(init_state, dtype=np.float32),
+            }
+        )
+
+    def step(self, actions: np.ndarray) -> dict:
+        return self._call(
+            {"cmd": "step", "actions": np.asarray(actions, dtype=np.float32)}
+        )
+
+    def close(self):
+        try:
+            if self.proc.poll() is None:
+                self._call({"cmd": "shutdown"})
+                self.proc.wait(timeout=60)
+        except Exception as e:
+            print(f"[WARN] MPC worker shutdown: {e}", flush=True)
+            if self.proc.poll() is None:
+                self.proc.kill()
+
+
+def run_sim_subprocess(plans, success_threshold: float) -> dict:
+    """开环：一次性子进程跑完全部 plans。"""
     tmpdir = Path(tempfile.mkdtemp(prefix="granular_eval_"))
     plans_path = tmpdir / "plans.pkl"
     metrics_path = tmpdir / "metrics.json"
@@ -113,20 +216,12 @@ def run_sim_subprocess(plans, success_threshold: float) -> dict:
     env["EGL_GPU"] = egl_gpu
     env.pop("CUDA_VISIBLE_DEVICES", None)
     print(
-        f"[INFO] Phase-2: 子进程仿真 EGL_GPU={egl_gpu} CUDA_VISIBLE_DEVICES=(unset)",
+        f"[INFO] Phase-2 openloop: 子进程仿真 EGL_GPU={egl_gpu}",
         flush=True,
     )
-    print(f"[INFO] cmd: {' '.join(cmd)}", flush=True)
     ret = subprocess.run(cmd, env=env)
     if ret.returncode != 0:
-        raise RuntimeError(
-            f"仿真子进程失败, exit={ret.returncode}。\n"
-            f"请用两步法（父进程完全退出后再仿真）:\n"
-            f"  python eval_granular.py --plan-only --plans-out ./outputs/granular_plans.pkl ...\n"
-            f"  unset CUDA_VISIBLE_DEVICES; export EGL_GPU={egl_gpu}\n"
-            f"  python eval_granular_sim_worker.py --plans ./outputs/granular_plans.pkl "
-            f"--output ./outputs/granular_metrics.json --success-threshold {success_threshold}"
-        )
+        raise RuntimeError(f"仿真子进程失败, exit={ret.returncode}")
     with open(metrics_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -139,24 +234,203 @@ def write_results(metrics: dict, results_path: Path):
             f.write(f"{k}: {v}\n")
 
 
+def _fit_proprio(prop: np.ndarray, ref_dim: int) -> np.ndarray:
+    prop = np.asarray(prop, dtype=np.float32).reshape(-1)
+    if prop.size == ref_dim:
+        return prop
+    if prop.size > ref_dim:
+        return prop[:ref_dim]
+    out = np.zeros(ref_dim, dtype=np.float32)
+    out[: prop.size] = prop
+    return out
+
+
+def run_mpc_episodes(
+    h5_path: str,
+    model,
+    process,
+    transform,
+    device,
+    client: FlexMpcClient,
+    *,
+    num_eval: int,
+    goal_offset_steps: int,
+    horizon: int,
+    history_size: int,
+    action_dim: int,
+    n_taken_actions: int,
+    mpc_max_iters: int,
+    success_threshold: float,
+    seed: int,
+    cem_kwargs: dict,
+) -> dict:
+    """MPC：CEM → 执行 n_taken → 用仿真观测重规划。"""
+    import torch
+
+    lookup = build_goal_lookup(h5_path)
+    eval_episodes, eval_start_idx = sample_eval_points(
+        h5_path, num_eval, goal_offset_steps, history_size, seed
+    )
+
+    successes = []
+    cds = []
+    costs = []
+    mpc_iters_list = []
+
+    for i, (ep_id, start_step) in enumerate(zip(eval_episodes, eval_start_idx)):
+        print(
+            f"\n[mpc {i + 1}/{num_eval}] episode={ep_id} start={start_step}",
+            flush=True,
+        )
+        goal_step = int(start_step + goal_offset_steps)
+        start_idx = lookup[(int(ep_id), int(start_step))]
+        goal_idx = lookup[(int(ep_id), goal_step)]
+
+        _, _, _, init_state = load_frame(h5_path, start_idx)
+        goal_pixels, _, goal_proprio, goal_state = load_frame(h5_path, goal_idx)
+        if init_state is None or goal_state is None:
+            print("  [WARN] 缺少 state，跳过")
+            continue
+
+        clip0 = load_sequence(h5_path, lookup, ep_id, start_step, history_size)
+        pixels_np = clip0["pixels"].numpy() if hasattr(clip0["pixels"], "numpy") else np.asarray(clip0["pixels"])
+        proprio_np = (
+            clip0["proprio"].numpy()
+            if hasattr(clip0["proprio"], "numpy")
+            else np.asarray(clip0["proprio"])
+        )
+        act_np = (
+            clip0["action"].numpy()
+            if hasattr(clip0["action"], "numpy")
+            else np.asarray(clip0["action"])
+        )
+
+        hist_pixels = [to_hwc_uint8_compatible(pixels_np[t]) for t in range(history_size)]
+        hist_proprio = [np.asarray(proprio_np[t], dtype=np.float32).reshape(-1) for t in range(history_size)]
+        prop_dim = int(hist_proprio[0].size)
+        hist_act = [np.asarray(act_np[t], dtype=np.float32).reshape(-1) for t in range(history_size)]
+
+        goal_particles = to_particle_state(goal_state)
+        prep = client.prepare(seed=int(seed + i), init_state=init_state)
+        final_state = to_particle_state(prep["state"])
+        cd = chamfer_distance_np(goal_particles, final_state)
+        plan_costs = []
+        n_iters = 0
+        success = cd < success_threshold
+
+        for it in range(mpc_max_iters):
+            cd = chamfer_distance_np(goal_particles, final_state)
+            if cd < success_threshold:
+                success = True
+                print(f"  [MPC] early success at iter={it} cd={cd:.4f}", flush=True)
+                break
+
+            clip = {
+                "pixels": np.stack(hist_pixels),
+                "action": np.stack(hist_act).astype(np.float32),
+                "proprio": np.stack(hist_proprio).astype(np.float32),
+            }
+            clip_t = {
+                "pixels": torch.from_numpy(clip["pixels"]),
+                "action": torch.from_numpy(clip["action"]).float(),
+                "proprio": torch.from_numpy(clip["proprio"]).float(),
+            }
+            # build_info_dict 期望 pixels 可转 numpy；uint8 HWC ok
+            info = build_info_dict(
+                clip_t, goal_pixels, goal_proprio, process, transform
+            )
+            planned_norm, plan_cost = cem_plan(
+                model,
+                info,
+                horizon=horizon,
+                action_dim=action_dim,
+                device=device,
+                **cem_kwargs,
+            )
+            plan_costs.append(float(plan_cost))
+            n_iters = it + 1
+
+            planned = denormalize_actions(
+                planned_norm.detach().cpu().numpy(), process
+            )
+            n_take = min(int(n_taken_actions), int(planned.shape[0]))
+            take_actions = planned[:n_take]
+            print(
+                f"  [MPC {it + 1}/{mpc_max_iters}] cost={plan_cost:.4f} "
+                f"take={n_take} cd={cd:.4f}",
+                flush=True,
+            )
+
+            step_out = client.step(take_actions)
+            visuals = np.asarray(step_out["visuals"])
+            proprios = np.asarray(step_out["proprios"])
+            final_state = to_particle_state(step_out["final_state"])
+
+            new_pixels = []
+            new_proprio = []
+            for t in range(n_take):
+                new_pixels.append(to_hwc_uint8_compatible(visuals[t]))
+                if proprios.ndim == 1:
+                    p = proprios
+                else:
+                    p = proprios[t]
+                new_proprio.append(_fit_proprio(p, prop_dim))
+
+            for t in range(n_take):
+                hist_act.append(np.asarray(take_actions[t], dtype=np.float32).reshape(-1))
+            hist_act = hist_act[-history_size:]
+            hist_pixels = (hist_pixels + new_pixels)[-history_size:]
+            hist_proprio = (hist_proprio + new_proprio)[-history_size:]
+
+            cd = chamfer_distance_np(goal_particles, final_state)
+            success = cd < success_threshold
+            if success:
+                print(f"  [MPC] success after iter={it + 1} cd={cd:.4f}", flush=True)
+                break
+
+        successes.append(bool(success))
+        cds.append(float(cd))
+        costs.append(float(np.mean(plan_costs)) if plan_costs else -1.0)
+        mpc_iters_list.append(int(n_iters))
+        print(
+            f"  done: success={success} cd={cd:.4f} mpc_iters={n_iters}",
+            flush=True,
+        )
+
+    cds_arr = np.asarray(cds, dtype=np.float64) if cds else np.array([])
+    return {
+        "num_eval": len(successes),
+        "success_rate": float(np.mean(successes) * 100.0) if successes else 0.0,
+        "success_threshold": success_threshold,
+        "mean_chamfer_distance": float(cds_arr.mean()) if cds_arr.size else -1.0,
+        "median_chamfer_distance": float(np.median(cds_arr)) if cds_arr.size else -1.0,
+        "mean_planning_cost": float(np.mean(costs)) if costs else -1.0,
+        "mean_mpc_iters": float(np.mean(mpc_iters_list)) if mpc_iters_list else -1.0,
+        "object_name": "granular",
+        "planner": "mpc",
+        "n_taken_actions": n_taken_actions,
+        "mpc_max_iters": mpc_max_iters,
+    }
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="LeWM Granular 仿真评估")
     p.add_argument("--dataset", default="./data/granular_eval.h5")
     p.add_argument("--ckpt", default="./data/lewm_granular_v1_weights.ckpt")
-    p.add_argument("--num-eval", type=int, default=10)
-    p.add_argument("--goal-offset", type=int, default=15)
+    p.add_argument("--num-eval", type=int, default=50)
+    p.add_argument(
+        "--goal-offset",
+        type=int,
+        default=5,
+        help="目标相对 start 的步数；须与 --horizon 对齐",
+    )
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--history-size", type=int, default=3)
     p.add_argument("--action-dim", type=int, default=4)
     p.add_argument("--frameskip", type=int, default=1)
     p.add_argument("--img-size", type=int, default=224)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--success-threshold",
-        type=float,
-        default=1.0,
-        help="Chamfer Distance < thr 算成功",
-    )
+    p.add_argument("--success-threshold", type=float, default=1.0)
     p.add_argument("--output", default="./outputs/granular_sim_results.txt")
 
     p.add_argument("--embed-dim", type=int, default=192)
@@ -173,28 +447,33 @@ def parse_args():
     p.add_argument("--cem-n-steps", type=int, default=30)
     p.add_argument("--cem-topk", type=int, default=30)
     p.add_argument("--cem-var-scale", type=float, default=1.0)
+    p.add_argument("--plan-device", default="cuda", choices=["cuda", "cpu"])
+    p.add_argument("--plan-gpu", type=str, default=_DEFAULT_PLAN_GPU)
+    p.add_argument("--egl-gpu", type=str, default=_DEFAULT_EGL_GPU)
+
     p.add_argument(
-        "--plan-device",
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help="CEM 规划设备",
+        "--planner",
+        choices=["mpc", "openloop"],
+        default="mpc",
+        help="mpc=滚动规划（默认）；openloop=旧开环 CEM",
     )
     p.add_argument(
-        "--plan-gpu",
-        type=str,
-        default=_DEFAULT_PLAN_GPU,
-        help=f"规划用物理 GPU（可用 3/4/5/6/7），默认 {_DEFAULT_PLAN_GPU}",
+        "--n-taken-actions",
+        type=int,
+        default=3,
+        help="MPC 每轮执行的 action 数（对齐 Wall 消融最优 3）",
     )
     p.add_argument(
-        "--egl-gpu",
-        type=str,
-        default=_DEFAULT_EGL_GPU,
-        help=f"Flex/EGL 用物理 GPU（须与 plan-gpu 不同），默认 {_DEFAULT_EGL_GPU}",
+        "--mpc-max-iters",
+        type=int,
+        default=8,
+        help="MPC 最大重规划轮数",
     )
-    p.add_argument("--plans-out", type=str, default=None, help="保存规划结果 pkl")
-    p.add_argument("--plan-only", action="store_true", help="只规划并保存，不仿真")
-    p.add_argument("--sim-from-plans", type=str, default=None, help="跳过规划，直接对已有 pkl 仿真")
-    p.add_argument("--smoke-env", action="store_true", help="只测 Flex 环境初始化")
+
+    p.add_argument("--plans-out", type=str, default=None)
+    p.add_argument("--plan-only", action="store_true", help="仅 openloop：只规划不仿真")
+    p.add_argument("--sim-from-plans", type=str, default=None)
+    p.add_argument("--smoke-env", action="store_true")
     return p.parse_args()
 
 
@@ -203,28 +482,24 @@ def main():
 
     args = parse_args()
 
-    # 再次对齐（parse 后的值）
     if args.plan_gpu == args.egl_gpu:
         raise SystemExit(
             f"PLAN_GPU 与 EGL_GPU 不能相同（当前都是 {args.plan_gpu}）。"
-            f"可用卡: 3,4,5,6,7，例如 --plan-gpu 3 --egl-gpu 4"
+            f"例如 --plan-gpu 3 --egl-gpu 4"
         )
     os.environ["PLAN_GPU"] = str(args.plan_gpu)
     os.environ["EGL_GPU"] = str(args.egl_gpu)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.plan_gpu)
 
     print("=" * 60)
-    print("LeWM Granular 仿真评估（规划卡 ≠ Flex 卡；仿真在子进程）")
+    print("LeWM Granular 仿真评估（规划卡 ≠ Flex 卡）")
     print("=" * 60)
     print(
         f"[INFO] PLAN_GPU={os.environ.get('PLAN_GPU')} EGL_GPU={os.environ.get('EGL_GPU')} "
-        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
+        f"planner={args.planner}"
     )
 
     if args.smoke_env:
-        import subprocess
-        import tempfile
-
         tmp = Path(tempfile.mkdtemp(prefix="granular_smoke_"))
         plans_path = tmp / "plans.pkl"
         metrics_path = tmp / "m.json"
@@ -243,11 +518,6 @@ def main():
             "--object-name",
             "granular",
         ]
-        print(
-            f"[INFO] smoke-env via subprocess EGL_GPU={env['EGL_GPU']} "
-            f"CUDA_VISIBLE_DEVICES=(unset)...",
-            flush=True,
-        )
         ret = subprocess.run(cmd, env=env)
         if ret.returncode != 0:
             raise RuntimeError("smoke-env 失败")
@@ -257,15 +527,10 @@ def main():
     if args.sim_from_plans:
         with open(args.sim_from_plans, "rb") as f:
             plans = pickle.load(f)
-        print(f"[INFO] 从 {args.sim_from_plans} 加载 {len(plans)} 条规划", flush=True)
         metrics = run_sim_subprocess(plans, success_threshold=args.success_threshold)
         metrics["mode"] = "sim_from_plans"
-        print("\n" + "=" * 60)
-        print("结果:")
-        for k, v in metrics.items():
-            print(f"  {k}: {v}")
         write_results(metrics, Path(args.output))
-        print(f"\n已写入: {args.output}")
+        print(f"已写入: {args.output}")
         return
 
     dataset_path = Path(args.dataset)
@@ -278,10 +543,10 @@ def main():
     effective_act_dim = args.frameskip * args.action_dim
     print(f"dataset: {dataset_path}")
     print(f"ckpt:    {ckpt_path}")
-    print(f"num_eval={args.num_eval} goal_offset={args.goal_offset} horizon={args.horizon}")
     print(
-        f"history={args.history_size} action_dim={effective_act_dim} "
-        f"success_thr={args.success_threshold}"
+        f"num_eval={args.num_eval} goal_offset={args.goal_offset} horizon={args.horizon} "
+        f"planner={args.planner} n_taken={args.n_taken_actions} "
+        f"mpc_max_iters={args.mpc_max_iters}"
     )
 
     process = build_processors(str(dataset_path), ("action", "proprio"))
@@ -290,7 +555,7 @@ def main():
         "goal": img_transform(args.img_size),
     }
 
-    print("\n[INFO] Phase-1: 加载模型并 CEM 规划（无 PyFleX）...", flush=True)
+    print("\n[INFO] 加载模型...", flush=True)
     model = load_lewm_model(
         str(ckpt_path),
         action_dim=effective_act_dim,
@@ -313,60 +578,97 @@ def main():
     model = model.to(device)
     print(f"[INFO] plan device={device}", flush=True)
 
+    cem_kwargs = dict(
+        num_samples=args.cem_num_samples,
+        n_steps=args.cem_n_steps,
+        topk=args.cem_topk,
+        var_scale=args.cem_var_scale,
+    )
+
     t0 = time.time()
-    plans = plan_episodes(
-        str(dataset_path),
-        model,
-        process,
-        transform,
-        device,
-        num_eval=args.num_eval,
-        goal_offset_steps=args.goal_offset,
-        horizon=args.horizon,
-        history_size=args.history_size,
-        action_dim=effective_act_dim,
-        seed=args.seed,
-        cem_num_samples=args.cem_num_samples,
-        cem_n_steps=args.cem_n_steps,
-        cem_topk=args.cem_topk,
-        cem_var_scale=args.cem_var_scale,
-    )
-    plan_time = time.time() - t0
-    print(f"[INFO] 规划完成: {len(plans)} 条, {plan_time:.1f}s", flush=True)
-
-    plans_out = args.plans_out or str(ROOT / "outputs" / "granular_plans.pkl")
-    Path(plans_out).parent.mkdir(parents=True, exist_ok=True)
-    with open(plans_out, "wb") as f:
-        pickle.dump(plans, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"[INFO] 规划已保存: {plans_out}", flush=True)
-
-    release_torch_cuda(model)
-    model = None
-
-    if args.plan_only:
-        print("[INFO] --plan-only：请另开命令跑仿真（父进程需完全退出）:")
-        print(
-            f"  unset CUDA_VISIBLE_DEVICES; export EGL_GPU={args.egl_gpu}\n"
-            f"  python eval_granular_sim_worker.py --plans {plans_out} "
-            f"--output {args.output}.metrics.json --success-threshold {args.success_threshold}"
+    if args.planner == "mpc":
+        if args.plan_only:
+            raise SystemExit("MPC 模式不支持 --plan-only（需要 plan↔sim 交错）")
+        client = FlexMpcClient(egl_gpu=str(args.egl_gpu), object_name="granular")
+        try:
+            metrics = run_mpc_episodes(
+                str(dataset_path),
+                model,
+                process,
+                transform,
+                device,
+                client,
+                num_eval=args.num_eval,
+                goal_offset_steps=args.goal_offset,
+                horizon=args.horizon,
+                history_size=args.history_size,
+                action_dim=effective_act_dim,
+                n_taken_actions=args.n_taken_actions,
+                mpc_max_iters=args.mpc_max_iters,
+                success_threshold=args.success_threshold,
+                seed=args.seed,
+                cem_kwargs=cem_kwargs,
+            )
+        finally:
+            client.close()
+            release_torch_cuda(model)
+        elapsed = time.time() - t0
+        metrics.update(
+            {
+                "mode": "mpc_two_process",
+                "plan_device": args.plan_device,
+                "plan_gpu": os.environ.get("PLAN_GPU"),
+                "egl_gpu": os.environ.get("EGL_GPU"),
+                "evaluation_time_sec": elapsed,
+            }
         )
-        return
+    else:
+        plans = plan_episodes(
+            str(dataset_path),
+            model,
+            process,
+            transform,
+            device,
+            num_eval=args.num_eval,
+            goal_offset_steps=args.goal_offset,
+            horizon=args.horizon,
+            history_size=args.history_size,
+            action_dim=effective_act_dim,
+            seed=args.seed,
+            cem_num_samples=args.cem_num_samples,
+            cem_n_steps=args.cem_n_steps,
+            cem_topk=args.cem_topk,
+            cem_var_scale=args.cem_var_scale,
+        )
+        plan_time = time.time() - t0
+        plans_out = args.plans_out or str(ROOT / "outputs" / "granular_plans.pkl")
+        Path(plans_out).parent.mkdir(parents=True, exist_ok=True)
+        with open(plans_out, "wb") as f:
+            pickle.dump(plans, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[INFO] 规划已保存: {plans_out}", flush=True)
+        release_torch_cuda(model)
+        model = None
 
-    t1 = time.time()
-    metrics = run_sim_subprocess(plans, success_threshold=args.success_threshold)
-    sim_time = time.time() - t1
-    metrics.update(
-        {
-            "mode": "sim_two_process",
-            "plan_device": args.plan_device,
-            "plan_gpu": os.environ.get("PLAN_GPU"),
-            "egl_gpu": os.environ.get("EGL_GPU"),
-            "plans_path": plans_out,
-            "planning_time_sec": plan_time,
-            "simulation_time_sec": sim_time,
-            "evaluation_time_sec": plan_time + sim_time,
-        }
-    )
+        if args.plan_only:
+            print("[INFO] --plan-only：请另开命令跑仿真")
+            return
+
+        t1 = time.time()
+        metrics = run_sim_subprocess(plans, success_threshold=args.success_threshold)
+        sim_time = time.time() - t1
+        metrics.update(
+            {
+                "mode": "openloop_two_process",
+                "planner": "openloop",
+                "plan_device": args.plan_device,
+                "plan_gpu": os.environ.get("PLAN_GPU"),
+                "egl_gpu": os.environ.get("EGL_GPU"),
+                "plans_path": plans_out,
+                "planning_time_sec": plan_time,
+                "simulation_time_sec": sim_time,
+                "evaluation_time_sec": plan_time + sim_time,
+            }
+        )
 
     print("\n" + "=" * 60)
     print("结果:")
