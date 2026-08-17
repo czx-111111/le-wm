@@ -1,0 +1,87 @@
+# @package _global_
+defaults:
+  - _self_
+  - data: rope
+
+# C1：16 spatial tokens + dense token MSE + M_task terminal sparse cost
+output_model_name: lewm_rope_c1
+subdir: ${output_model_name}_${now:%Y%m%d_%H%M%S}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+dump_object: True
+save_object_every_n_epochs: 10
+
+checkpoint:
+  monitor: validate/pred_loss
+  mode: min
+  save_top_k: 1
+
+trainer:
+  max_epochs: 100
+  devices: [0, 7]
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  accumulate_grad_batches: 4
+
+loader:
+  batch_size: 16
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 3.0e-5
+  weight_decay: 1.0e-3
+
+wandb:
+  enabled: True
+  config:
+    entity: derorice_1-taiyuan-university-of-technology
+    project: le-wm-test
+    name: ${subdir}
+    id: ${subdir}
+    resume: never
+    log_model: False
+
+wm:
+  type: lewm
+  token_mode: spatial16
+  num_spatial_tokens: 16
+  spatial_grid: 4
+  history_size: 3
+  num_preds: 1
+  embed_dim: 192
+  action_dim: 4
+
+plan:
+  cost_mode: m_task_terminal
+  m_task_mode: eps
+  m_task_threshold: 0.08
+  m_task_topk: 4
+  m_task_assume_normalized: true
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024

@@ -1,0 +1,10 @@
+name: ballnav
+args: []
+kwargs:
+  device: "gpu"
+  num_obstacles: 1
+
+dataset: null  # ballnav doesn't need a dataset
+
+decoder_path: null
+num_workers: 4

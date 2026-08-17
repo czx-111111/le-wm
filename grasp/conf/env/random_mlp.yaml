@@ -1,0 +1,17 @@
+name: random_mlp
+args: []
+kwargs:
+  device: "gpu"
+  state_dim: 64
+  action_dim: 64
+  H: 10
+
+dataset: null  # random_mlp doesn't need a dataset
+
+decoder_path: null
+num_workers: 4
+
+model:
+  state_dim: 64
+  action_dim: 64
+  H: 10

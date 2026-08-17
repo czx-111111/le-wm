@@ -13,9 +13,16 @@ from omegaconf import OmegaConf, open_dict
 
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from jepa import JEPA
-from module import ARPredictor, Embedder, MLP, SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from einops import rearrange
+
+from module import SIGReg
+from utils import (
+    build_lewm,
+    get_column_normalizer,
+    get_img_preprocessor,
+    ModelObjectCallBack,
+)
+
 
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
@@ -29,7 +36,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
     output = self.model.encode(batch)
 
-    emb = output["emb"]  # (B, T, D)
+    emb = output["emb"]  # (B, T, D) or (B, T, N, D)
     act_emb = output["act_emb"]
 
     ctx_emb = emb[:, :ctx_len]
@@ -38,10 +45,15 @@ def lejepa_forward(self, batch, stage, cfg):
     tgt_emb = emb[:, n_preds:] # label
     pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
 
-    # LeWM loss
+    # LeWM loss (ordinary token MSE — dense over all spatial tokens when N>1)
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    if emb.ndim == 4:
+        # SIGReg expects (T, batch', D); flatten spatial into batch
+        sigreg_in = rearrange(emb, "b t n d -> t (b n) d")
+    else:
+        sigreg_in = emb.transpose(0, 1)
+    output["sigreg_loss"] = self.sigreg(sigreg_in)
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, on_epoch=True, sync_dist=True)
@@ -83,50 +95,25 @@ def run(cfg):
     ##       model / optim      ##
     ##############################
 
-    encoder = spt.backbone.utils.vit_hf(
-        cfg.encoder_scale,
-        patch_size=cfg.patch_size,
-        image_size=cfg.img_size,
-        pretrained=False,
-        use_mask_token=False,
-    )
-
-    hidden_dim = encoder.config.hidden_size
-    embed_dim = cfg.wm.get("embed_dim", hidden_dim)
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
-
-    predictor = ARPredictor(
-        num_frames=cfg.wm.history_size,
-        input_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        output_dim=hidden_dim,
-        **cfg.predictor,
+    plan_cfg = cfg.get("plan") or {}
+    world_model = build_lewm(
+        action_dim=effective_act_dim,
+        history_size=cfg.wm.history_size,
+        embed_dim=cfg.wm.get("embed_dim", 192),
+        encoder_scale=cfg.encoder_scale,
+        patch_size=cfg.patch_size,
+        img_size=cfg.img_size,
+        predictor_cfg=dict(cfg.predictor),
+        token_mode=cfg.wm.get("token_mode", "cls"),
+        num_spatial_tokens=int(cfg.wm.get("num_spatial_tokens", 1)),
+        spatial_grid=int(cfg.wm.get("spatial_grid", 4)),
+        cost_mode=str(plan_cfg.get("cost_mode", "dense_terminal")),
+        m_task_threshold=plan_cfg.get("m_task_threshold", 0.08),
+        m_task_mode=str(plan_cfg.get("m_task_mode", "eps")),
+        m_task_topk=int(plan_cfg.get("m_task_topk", 4)),
+        m_task_assume_normalized=bool(plan_cfg.get("m_task_assume_normalized", True)),
     )
-
-    action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
-    
-    projector = MLP(
-        input_dim=hidden_dim,
-        output_dim=embed_dim,
-        hidden_dim=2048,
-        norm_fn=torch.nn.BatchNorm1d,
-    )
-
-    predictor_proj = MLP(
-        input_dim=hidden_dim,
-        output_dim=embed_dim,
-        hidden_dim=2048,
-        norm_fn=torch.nn.BatchNorm1d,
-    )
-
-    world_model = JEPA(
-        encoder=encoder,
-        predictor=predictor,
-        action_encoder=action_encoder,
-        projector=projector,
-        pred_proj=predictor_proj,
-    )
-
     optimizers = {
         'model_opt': {
             "modules": 'model',

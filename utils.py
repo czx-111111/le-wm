@@ -148,3 +148,101 @@ def load_lewm_weights_into_model(model, ckpt_path: str):
             f"{result.unexpected_keys[:8]}..."
         )
     return model
+
+
+def build_lewm(
+    *,
+    action_dim: int,
+    history_size: int = 3,
+    embed_dim: int = 192,
+    encoder_scale: str = "tiny",
+    patch_size: int = 14,
+    img_size: int = 224,
+    predictor_cfg=None,
+    predictor_depth: int = 6,
+    predictor_heads: int = 16,
+    predictor_mlp_dim: int = 2048,
+    predictor_dim_head: int = 64,
+    predictor_dropout: float = 0.1,
+    predictor_emb_dropout: float = 0.0,
+    smoothed_dim: int = 10,
+    token_mode: str = "cls",
+    num_spatial_tokens: int = 1,
+    spatial_grid: int = 4,
+    cost_mode: str = "dense_terminal",
+    m_task_threshold=0.08,
+    m_task_mode: str = "eps",
+    m_task_topk: int = 4,
+    m_task_assume_normalized: bool = True,
+):
+    """Construct a JEPA world model (CLS or C1 spatial-16)."""
+    import stable_pretraining as spt
+    from jepa import JEPA
+    from module import ARPredictor, Embedder, MLP
+
+    encoder = spt.backbone.utils.vit_hf(
+        encoder_scale,
+        patch_size=patch_size,
+        image_size=img_size,
+        pretrained=False,
+        use_mask_token=False,
+    )
+    hidden_dim = encoder.config.hidden_size
+
+    pred_kwargs = {
+        "depth": predictor_depth,
+        "heads": predictor_heads,
+        "mlp_dim": predictor_mlp_dim,
+        "dim_head": predictor_dim_head,
+        "dropout": predictor_dropout,
+        "emb_dropout": predictor_emb_dropout,
+    }
+    if predictor_cfg:
+        pred_kwargs.update(predictor_cfg)
+
+    n_spatial = int(num_spatial_tokens)
+    if token_mode in ("spatial16", "spatial"):
+        n_spatial = max(n_spatial, spatial_grid * spatial_grid)
+
+    predictor = ARPredictor(
+        num_frames=history_size,
+        input_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        output_dim=hidden_dim,
+        num_spatial_tokens=n_spatial if token_mode in ("spatial16", "spatial") else 1,
+        **pred_kwargs,
+    )
+
+    action_encoder = Embedder(
+        input_dim=action_dim,
+        smoothed_dim=smoothed_dim,
+        emb_dim=embed_dim,
+    )
+    projector = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
+    predictor_proj = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
+
+    return JEPA(
+        encoder=encoder,
+        predictor=predictor,
+        action_encoder=action_encoder,
+        projector=projector,
+        pred_proj=predictor_proj,
+        token_mode=token_mode,
+        num_spatial_tokens=n_spatial if token_mode in ("spatial16", "spatial") else 1,
+        spatial_grid=spatial_grid,
+        cost_mode=cost_mode,
+        m_task_threshold=m_task_threshold,
+        m_task_mode=m_task_mode,
+        m_task_topk=m_task_topk,
+        m_task_assume_normalized=m_task_assume_normalized,
+    )

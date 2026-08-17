@@ -1,0 +1,12 @@
+_target_: planning.latco.LatCoPlanner
+horizon: 5
+init_noise_level: 0.3
+lr_s: 0.001
+lr_a: 0.01
+opt_steps: 100000
+eval_every: 10
+gamma_dynamics: 1.0
+
+opt: 'adam'
+scheduler_type: 'none'
+name: latco

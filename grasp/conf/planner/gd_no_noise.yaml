@@ -1,0 +1,11 @@
+_target_: planning.gd_no_noise.GDNoNoisePlanner
+horizon: 5
+sample_type: 'randn' # 'zero' or 'randn'
+lr: 0.1 
+opt_steps: 100
+eval_every: 10
+var_scale: 0.5
+clip_value: 2.0
+action_mag_coeff: 0.1
+action_clamp: 0 # clamp value for actions; 0 means no clamping
+name: gd_no_noise

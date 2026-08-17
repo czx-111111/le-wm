@@ -72,15 +72,19 @@ class Attention(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, causal=True):
+    def forward(self, x, causal=True, attn_mask=None):
         """
         x : (B, T, D)
+        attn_mask: optional additive mask broadcastable to (B, heads, T, T)
         """
         x = self.norm(x)
         drop = self.dropout if self.training else 0.0
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        use_causal = causal and attn_mask is None
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=use_causal
+        )
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
 
@@ -102,11 +106,15 @@ class ConditionalBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            causal=attn_mask is None,
+            attn_mask=attn_mask,
+        )
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -122,8 +130,10 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, attn_mask=None):
+        x = x + self.attn(
+            self.norm1(x), causal=attn_mask is None, attn_mask=attn_mask
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -170,7 +180,7 @@ class Transformer(nn.Module):
                 block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
             )
 
-    def forward(self, x, c=None):
+    def forward(self, x, c=None, attn_mask=None):
 
         if hasattr(self, "input_proj"):
             x = self.input_proj(x)
@@ -179,7 +189,10 @@ class Transformer(nn.Module):
             c = self.cond_proj(c)
 
         for block in self.layers:
-            x = block(x) if isinstance(block, Block) else block(x, c)
+            if isinstance(block, Block):
+                x = block(x, attn_mask=attn_mask)
+            else:
+                x = block(x, c, attn_mask=attn_mask)
         x = self.norm(x)
 
         if hasattr(self, "output_proj"):
@@ -241,8 +254,20 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+def block_causal_attn_mask(num_frames: int, num_spatial: int, device, dtype):
+    """Additive mask: attend to all spatial tokens in frames <= current frame."""
+    t_idx = torch.arange(num_frames, device=device).repeat_interleave(num_spatial)
+    allow = t_idx[None, :] <= t_idx[:, None]
+    mask = torch.zeros(t_idx.numel(), t_idx.numel(), device=device, dtype=dtype)
+    return mask.masked_fill(~allow, torch.finfo(dtype).min)
+
+
 class ARPredictor(nn.Module):
-    """Autoregressive predictor for next-step embedding prediction."""
+    """Autoregressive predictor for next-step embedding prediction.
+
+    Supports CLS (N=1, sequence length T) and spatial tokens (N>1, length T*N)
+    with time-block causal attention.
+    """
 
     def __init__(
         self,
@@ -257,9 +282,18 @@ class ARPredictor(nn.Module):
         dim_head=64,
         dropout=0.0,
         emb_dropout=0.0,
+        num_spatial_tokens: int = 1,
     ):
         super().__init__()
+        self.num_frames = num_frames
+        self.num_spatial_tokens = int(num_spatial_tokens)
         self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
+        if self.num_spatial_tokens > 1:
+            self.spatial_pos_embedding = nn.Parameter(
+                torch.randn(1, 1, self.num_spatial_tokens, input_dim)
+            )
+        else:
+            self.spatial_pos_embedding = None
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             input_dim,
@@ -275,9 +309,26 @@ class ARPredictor(nn.Module):
 
     def forward(self, x, c):
         """
-        x: (B, T, d)
+        x: (B, T, d) or (B, T, N, d)
         c: (B, T, act_dim)
         """
+        spatial = x.ndim == 4
+        if spatial:
+            B, T, N, D = x.shape
+            assert N == self.num_spatial_tokens, (
+                f"expected {self.num_spatial_tokens} spatial tokens, got {N}"
+            )
+            x = x + self.pos_embedding[:, :T, None, :]
+            if self.spatial_pos_embedding is not None:
+                x = x + self.spatial_pos_embedding[:, :, :N, :]
+            c = c.unsqueeze(2).expand(-1, -1, N, -1)
+            x = rearrange(x, "b t n d -> b (t n) d")
+            c = rearrange(c, "b t n d -> b (t n) d")
+            attn_mask = block_causal_attn_mask(T, N, x.device, x.dtype)
+            x = self.dropout(x)
+            x = self.transformer(x, c, attn_mask=attn_mask)
+            return rearrange(x, "b (t n) d -> b t n d", t=T, n=N)
+
         T = x.size(1)
         x = x + self.pos_embedding[:, :T]
         x = self.dropout(x)

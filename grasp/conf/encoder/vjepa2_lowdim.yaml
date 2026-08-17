@@ -1,0 +1,3 @@
+_target_: models.vjepa.VJepaV2LowdimEncoder
+name: "vjepa2_vitl"
+output_dim: 16

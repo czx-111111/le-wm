@@ -1,0 +1,18 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+# Keep linting lightweight and focused on obvious issues. Many stylistic rules are
+# disabled to avoid large, invasive changes to the existing research code.
+select = ["E", "F"]
+ignore = [
+    "E501",  # line length
+    "F401",  # unused imports (common in config-driven code)
+    "F403",  # star-imports
+    "F841",  # unused variables (often for debugging / future use)
+]
+
+[tool.black]
+target-version = ["py39"]
+line-length = 100
+

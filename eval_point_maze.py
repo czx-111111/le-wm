@@ -222,9 +222,7 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 
 import stable_pretraining as spt
-from jepa import JEPA
-from module import ARPredictor, Embedder, MLP
-from utils import load_lewm_weights_into_model
+from utils import build_lewm, load_lewm_weights_into_model
 from eval_mpc_utils import (
     as_numpy,
     extract_macro_frames,
@@ -523,54 +521,59 @@ def load_lewm_model(
     predictor_dim_head: int = 64,
     predictor_dropout: float = 0.1,
     predictor_emb_dropout: float = 0.0,
+    token_mode: str = "cls",
+    num_spatial_tokens: int = 1,
+    spatial_grid: int = 4,
+    cost_mode: str = "dense_terminal",
+    m_task_threshold: float = 0.08,
+    m_task_mode: str = "eps",
+    m_task_topk: int = 4,
+    m_task_assume_normalized: bool = True,
 ):
     # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(checkpoint, nn.Module):
         model = checkpoint
         print(f"[INFO] loaded pickled JEPA object from {ckpt_path}")
+        model.cost_mode = cost_mode
+        model.m_task_threshold = m_task_threshold
+        model.m_task_mode = m_task_mode
+        model.m_task_topk = m_task_topk
+        model.m_task_assume_normalized = m_task_assume_normalized
+        if not hasattr(model, "token_mode"):
+            model.token_mode = "cls"
+        if not hasattr(model, "num_spatial_tokens"):
+            model.num_spatial_tokens = 1
+        if not hasattr(model, "spatial_grid"):
+            model.spatial_grid = 4
+        if token_mode != "cls" and getattr(model, "token_mode", "cls") != token_mode:
+            print(
+                f"[WARN] ckpt token_mode={model.token_mode} "
+                f"!= requested {token_mode}; using ckpt"
+            )
     else:
-        encoder = spt.backbone.utils.vit_hf(
-            encoder_scale,
+        model = build_lewm(
+            action_dim=action_dim,
+            history_size=history_size,
+            embed_dim=embed_dim,
+            encoder_scale=encoder_scale,
             patch_size=patch_size,
-            image_size=img_size,
-            pretrained=False,
-            use_mask_token=False,
-        )
-        hidden_dim = encoder.config.hidden_size
-
-        predictor = ARPredictor(
-            num_frames=history_size,
-            input_dim=embed_dim,
-            hidden_dim=hidden_dim,
-            output_dim=hidden_dim,
-            depth=predictor_depth,
-            heads=predictor_heads,
-            mlp_dim=predictor_mlp_dim,
-            dim_head=predictor_dim_head,
-            dropout=predictor_dropout,
-            emb_dropout=predictor_emb_dropout,
-        )
-
-        action_encoder = Embedder(
-            input_dim=action_dim,
+            img_size=img_size,
+            predictor_depth=predictor_depth,
+            predictor_heads=predictor_heads,
+            predictor_mlp_dim=predictor_mlp_dim,
+            predictor_dim_head=predictor_dim_head,
+            predictor_dropout=predictor_dropout,
+            predictor_emb_dropout=predictor_emb_dropout,
             smoothed_dim=smoothed_dim,
-            emb_dim=embed_dim,
-        )
-
-        projector = MLP(
-            input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d
-        )
-        predictor_proj = MLP(
-            input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048, norm_fn=nn.BatchNorm1d
-        )
-
-        model = JEPA(
-            encoder=encoder,
-            predictor=predictor,
-            action_encoder=action_encoder,
-            projector=projector,
-            pred_proj=predictor_proj,
+            token_mode=token_mode,
+            num_spatial_tokens=num_spatial_tokens,
+            spatial_grid=spatial_grid,
+            cost_mode=cost_mode,
+            m_task_threshold=m_task_threshold,
+            m_task_mode=m_task_mode,
+            m_task_topk=m_task_topk,
+            m_task_assume_normalized=m_task_assume_normalized,
         )
         model = load_lewm_weights_into_model(model, ckpt_path)
 
@@ -578,6 +581,11 @@ def load_lewm_model(
     print(
         f"[INFO] action_encoder.patch_embed.weight = {tuple(w.shape)} "
         f"(期望 {(smoothed_dim, action_dim, 1)})"
+    )
+    print(
+        f"[INFO] token_mode={getattr(model, 'token_mode', 'cls')} "
+        f"cost_mode={getattr(model, 'cost_mode', 'dense_terminal')} "
+        f"num_spatial_tokens={getattr(model, 'num_spatial_tokens', 1)}"
     )
 
     model.eval()
@@ -863,6 +871,14 @@ def evaluate(args):
         predictor_mlp_dim=args.predictor_mlp_dim,
         predictor_dim_head=args.predictor_dim_head,
         predictor_dropout=args.predictor_dropout,
+        token_mode=args.token_mode,
+        num_spatial_tokens=args.num_spatial_tokens,
+        spatial_grid=args.spatial_grid,
+        cost_mode=args.cost_mode,
+        m_task_threshold=args.m_task_threshold,
+        m_task_mode=args.m_task_mode,
+        m_task_topk=args.m_task_topk,
+        m_task_assume_normalized=not args.m_task_raw_pixels,
     )
     model = model.to(device)
 
@@ -1049,6 +1065,28 @@ def parse_args():
     p.add_argument("--predictor-mlp-dim", type=int, default=2048)
     p.add_argument("--predictor-dim-head", type=int, default=64)
     p.add_argument("--predictor-dropout", type=float, default=0.1)
+    p.add_argument(
+        "--token-mode",
+        default="cls",
+        choices=["cls", "spatial16", "spatial"],
+        help="cls=baseline；spatial16=C1 16-token（weights ckpt 重建时用）",
+    )
+    p.add_argument("--num-spatial-tokens", type=int, default=16)
+    p.add_argument("--spatial-grid", type=int, default=4)
+    p.add_argument(
+        "--cost-mode",
+        default="dense_terminal",
+        choices=["dense_terminal", "m_task_terminal"],
+        help="规划 cost；C1 用 m_task_terminal；同 ckpt 可切 dense 做消融",
+    )
+    p.add_argument("--m-task-threshold", type=float, default=0.08)
+    p.add_argument("--m-task-mode", default="eps", choices=["eps", "topk", "mean"])
+    p.add_argument("--m-task-topk", type=int, default=4)
+    p.add_argument(
+        "--m-task-raw-pixels",
+        action="store_true",
+        help="若 info 像素未 ImageNet normalize，打开此开关",
+    )
 
     # 对齐 plan_point_maze.yaml: samples=300, opt_steps=10, topk=30
     p.add_argument("--cem-num-samples", type=int, default=300)

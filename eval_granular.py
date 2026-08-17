@@ -442,6 +442,18 @@ def parse_args():
     p.add_argument("--predictor-mlp-dim", type=int, default=2048)
     p.add_argument("--predictor-dim-head", type=int, default=64)
     p.add_argument("--predictor-dropout", type=float, default=0.1)
+    p.add_argument("--token-mode", default="cls", choices=["cls", "spatial16", "spatial"])
+    p.add_argument("--num-spatial-tokens", type=int, default=16)
+    p.add_argument("--spatial-grid", type=int, default=4)
+    p.add_argument(
+        "--cost-mode",
+        default="dense_terminal",
+        choices=["dense_terminal", "m_task_terminal"],
+    )
+    p.add_argument("--m-task-threshold", type=float, default=0.08)
+    p.add_argument("--m-task-mode", default="eps", choices=["eps", "topk", "mean"])
+    p.add_argument("--m-task-topk", type=int, default=4)
+    p.add_argument("--m-task-raw-pixels", action="store_true")
 
     p.add_argument("--cem-num-samples", type=int, default=300)
     p.add_argument("--cem-n-steps", type=int, default=30)
@@ -570,6 +582,14 @@ def main():
         predictor_mlp_dim=args.predictor_mlp_dim,
         predictor_dim_head=args.predictor_dim_head,
         predictor_dropout=args.predictor_dropout,
+        token_mode=args.token_mode,
+        num_spatial_tokens=args.num_spatial_tokens,
+        spatial_grid=args.spatial_grid,
+        cost_mode=args.cost_mode,
+        m_task_threshold=args.m_task_threshold,
+        m_task_mode=args.m_task_mode,
+        m_task_topk=args.m_task_topk,
+        m_task_assume_normalized=not args.m_task_raw_pixels,
     )
     if args.plan_device == "cuda" and not torch.cuda.is_available():
         print("[WARN] CUDA 不可用，plan-device 改用 cpu")

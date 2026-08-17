@@ -1,0 +1,2 @@
+_target_: models.vjepa.VJepaV2EncoderAggregated
+name: "vjepa2_vitl"

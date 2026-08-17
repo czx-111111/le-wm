@@ -1,0 +1,81 @@
+_target_: planning.grasp.GRASPPlanner
+# ==========================================
+# === Core GRASP parameters ================
+# ==========================================
+# Horizon and virtual states
+num_virtual_states: all # if int specified, num_virtual_states+1 must divide into horizon
+horizon: 5
+
+# Learning rates
+lr_s: 0.1
+lr_a: 0.001
+
+# Optimization
+opt_steps: 10000
+opt: 'adam'
+eval_every: 10
+
+# State exploration (Langevin-style noise)
+init_noise_level: 0.95
+state_noise_scale: 0.5
+
+# Dynamics loss weight
+rho_init: 1
+
+# Periodic sync (GD refinement)
+use_gd: True
+gd_interval: 100
+gd_opt_steps: 25
+gd_lr: 0.1
+
+# Initialization
+init_states_method: cylinder  # "cylinder" or "gaussian"
+init_actions_gaussian: True
+init_actions_mean: 0.0
+init_actions_std: 0.01
+
+# ==========================================
+# === Advanced parameters ==================
+# ==========================================
+
+# Lagrangian / action regularization
+lr_lagrangian: 0.01
+gamma_action: 0
+gamma_lagrangian: 0
+gamma_action_smooth: 0.0
+gamma_state_uniform: 0.0
+lagrangian_update_threshold: 1
+use_fixed_lagrangian: false
+state_noise_max: 1.0
+state_noise_proprio_only: false
+
+# GD refinement options
+gd_use_final_state_only: true
+gd_accept_reject: false
+num_parallel_trajectories: 1
+gd_top_k: 1
+gd_batch_size: null
+
+# CEM (alternative refinement)
+use_cem: false
+cem_interval: 100
+cem_num_samples: 100
+cem_variance_scale: 1
+cem_max_rollouts_per_batch: 20
+cem_gamma_discount: 0.99
+
+# Other
+constant_noise_schedule: true
+gamma_decay: 1
+enable_state_gradient: false
+action_clamp: 0
+gd_use_mppi: False
+mppi_temperature: 1.0
+
+# Implementation
+use_mixed_precision: True
+compile_world_model: False
+gradclip_val: 0
+visualize_states: true
+scheduler_type: 'none'
+name: grasp

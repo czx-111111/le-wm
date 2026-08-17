@@ -1,0 +1,10 @@
+_target_: planning.cem.CEMPlanner
+horizon: 5
+topk: 50
+num_samples: 500
+var_scale: 1
+opt_steps: 100
+eval_every: 1
+action_clamp: 0 # clamp value for actions; 0 means no clamping
+
+name: cem
