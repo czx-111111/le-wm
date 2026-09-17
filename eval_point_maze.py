@@ -529,6 +529,11 @@ def load_lewm_model(
     m_task_mode: str = "eps",
     m_task_topk: int = 4,
     m_task_assume_normalized: bool = True,
+    pool_mode: str = "avg",
+    include_global_token: bool = False,
+    pos_mode: str = "learned",
+    inject_every_layer: bool = False,
+    aux_nibble: bool = False,
 ):
     # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -546,6 +551,12 @@ def load_lewm_model(
             model.num_spatial_tokens = 1
         if not hasattr(model, "spatial_grid"):
             model.spatial_grid = 4
+        if not hasattr(model, "pool_mode"):
+            model.pool_mode = "avg"
+        if not hasattr(model, "include_global_token"):
+            model.include_global_token = False
+        if not hasattr(model, "pos_mode"):
+            model.pos_mode = "learned"
         if token_mode != "cls" and getattr(model, "token_mode", "cls") != token_mode:
             print(
                 f"[WARN] ckpt token_mode={model.token_mode} "
@@ -574,6 +585,11 @@ def load_lewm_model(
             m_task_mode=m_task_mode,
             m_task_topk=m_task_topk,
             m_task_assume_normalized=m_task_assume_normalized,
+            pool_mode=pool_mode,
+            include_global_token=include_global_token,
+            pos_mode=pos_mode,
+            inject_every_layer=inject_every_layer,
+            aux_nibble=aux_nibble,
         )
         model = load_lewm_weights_into_model(model, ckpt_path)
 
@@ -585,7 +601,10 @@ def load_lewm_model(
     print(
         f"[INFO] token_mode={getattr(model, 'token_mode', 'cls')} "
         f"cost_mode={getattr(model, 'cost_mode', 'dense_terminal')} "
-        f"num_spatial_tokens={getattr(model, 'num_spatial_tokens', 1)}"
+        f"num_spatial_tokens={getattr(model, 'num_spatial_tokens', 1)} "
+        f"pool_mode={getattr(model, 'pool_mode', 'avg')} "
+        f"include_global={getattr(model, 'include_global_token', False)} "
+        f"pos_mode={getattr(model, 'pos_mode', 'learned')}"
     )
 
     model.eval()
@@ -874,6 +893,11 @@ def evaluate(args):
         token_mode=args.token_mode,
         num_spatial_tokens=args.num_spatial_tokens,
         spatial_grid=args.spatial_grid,
+        pool_mode=args.pool_mode,
+        include_global_token=args.include_global_token,
+        pos_mode=args.pos_mode,
+        inject_every_layer=args.inject_every_layer,
+        aux_nibble=args.aux_nibble,
         cost_mode=args.cost_mode,
         m_task_threshold=args.m_task_threshold,
         m_task_mode=args.m_task_mode,
@@ -1073,6 +1097,11 @@ def parse_args():
     )
     p.add_argument("--num-spatial-tokens", type=int, default=16)
     p.add_argument("--spatial-grid", type=int, default=4)
+    p.add_argument("--pool-mode", default="avg", choices=["avg", "query"])
+    p.add_argument("--include-global-token", action="store_true")
+    p.add_argument("--pos-mode", default="learned", choices=["learned", "nibble"])
+    p.add_argument("--inject-every-layer", action="store_true")
+    p.add_argument("--aux-nibble", action="store_true")
     p.add_argument(
         "--cost-mode",
         default="dense_terminal",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -23,6 +25,118 @@ def denormalize_imagenet(pixels: torch.Tensor) -> torch.Tensor:
     mean = pixels.new_tensor(IMAGENET_MEAN).view(1, -1, 1, 1)
     std = pixels.new_tensor(IMAGENET_STD).view(1, -1, 1, 1)
     return (pixels.float() * std + mean).clamp(0.0, 1.0)
+
+
+def sincos_2d_pe(grid_h: int, grid_w: int, dim: int, device=None, dtype=None) -> torch.Tensor:
+    """(grid_h * grid_w, dim) 2D sine-cosine positional encoding."""
+    if dim % 4 != 0:
+        raise ValueError(f"sincos PE dim must be divisible by 4, got {dim}")
+    y, x = torch.meshgrid(
+        torch.arange(grid_h, device=device, dtype=torch.float32),
+        torch.arange(grid_w, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    omega = torch.arange(dim // 4, device=device, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / (dim // 4)))
+    out_y = torch.einsum("h,d->hd", y.reshape(-1), omega)
+    out_x = torch.einsum("w,d->wd", x.reshape(-1), omega)
+    pe = torch.cat([out_y.sin(), out_y.cos(), out_x.sin(), out_x.cos()], dim=1)
+    if dtype is not None:
+        pe = pe.to(dtype=dtype)
+    return pe
+
+
+def nibble_codes_from_attn(
+    attn: torch.Tensor,
+    spatial_grid: int = 4,
+    fine_grid: int = 16,
+):
+    """Quantize per-query attention into radix-16 nibble codes.
+
+    attn: (BT, N, P) over a square patch grid.
+    n_hi: slot id 0..N-1 (tokenization-aligned high nibble)
+    n_lo: centroid inside that slot's 4x4 window, 0..15
+    n_hi_content: coarse cell of the full-map centroid (aux target)
+    """
+    bt, n, p = attn.shape
+    side = int(math.sqrt(p))
+    if side * side != p:
+        raise ValueError(f"patch count {p} is not a square grid")
+    attn_map = attn.reshape(bt, n, side, side)
+    attn_fine = F.interpolate(
+        attn_map, size=(fine_grid, fine_grid), mode="bilinear", align_corners=False
+    )
+    g = int(spatial_grid)
+    cell = fine_grid // g
+    device = attn.device
+    n_hi = torch.arange(n, device=device).view(1, n).expand(bt, -1)
+
+    windows = []
+    for i in range(n):
+        row, col = divmod(i, g)
+        windows.append(
+            attn_fine[:, i, row * cell : (row + 1) * cell, col * cell : (col + 1) * cell]
+        )
+    window = torch.stack(windows, dim=1)  # (BT, N, cell, cell)
+    flat = window.flatten(2)
+    mass = flat.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    prob = (flat / mass).view(bt, n, cell, cell)
+    ys = torch.arange(cell, device=device, dtype=prob.dtype).view(1, 1, cell, 1)
+    xs = torch.arange(cell, device=device, dtype=prob.dtype).view(1, 1, 1, cell)
+    cy = (prob * ys).sum(dim=(2, 3))
+    cx = (prob * xs).sum(dim=(2, 3))
+    n_lo = (
+        cy.round().long().clamp(0, cell - 1) * cell
+        + cx.round().long().clamp(0, cell - 1)
+    )
+
+    fine_mass = attn_fine.flatten(2).sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    fine_prob = (attn_fine.flatten(2) / fine_mass).view(bt, n, fine_grid, fine_grid)
+    fy = torch.arange(fine_grid, device=device, dtype=fine_prob.dtype).view(
+        1, 1, fine_grid, 1
+    )
+    fx = torch.arange(fine_grid, device=device, dtype=fine_prob.dtype).view(
+        1, 1, 1, fine_grid
+    )
+    gy = (fine_prob * fy).sum(dim=(2, 3))
+    gx = (fine_prob * fx).sum(dim=(2, 3))
+    hi_r = (gy / cell).floor().long().clamp(0, g - 1)
+    hi_c = (gx / cell).floor().long().clamp(0, g - 1)
+    n_hi_content = hi_r * g + hi_c
+    return n_hi, n_lo, n_hi_content
+
+
+class SpatialQueryPool(nn.Module):
+    """Single-head cross-attention from a 4x4 query grid onto ViT patches."""
+
+    def __init__(self, hidden_dim: int, num_queries: int = 16, spatial_grid: int = 4):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.num_queries = int(num_queries)
+        self.spatial_grid = int(spatial_grid)
+        self.query = nn.Parameter(torch.zeros(1, self.num_queries, self.hidden_dim))
+        self.q_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.out_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.scale = self.hidden_dim**-0.5
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        pe = sincos_2d_pe(self.spatial_grid, self.spatial_grid, self.hidden_dim)
+        with torch.no_grad():
+            self.query.copy_(pe.unsqueeze(0))
+            self.query.add_(0.02 * torch.randn_like(self.query))
+
+    def forward(self, patches: torch.Tensor):
+        """patches: (BT, P, H) -> slots (BT, N, H), attn (BT, N, P)."""
+        bt = patches.size(0)
+        q = self.q_proj(self.query.expand(bt, -1, -1))
+        k = self.k_proj(patches)
+        v = self.v_proj(patches)
+        attn = torch.matmul(q, k.transpose(-2, -1)).mul_(self.scale).softmax(dim=-1)
+        slots = self.out_proj(torch.matmul(attn, v))
+        return slots, attn
 
 
 def compute_m_task_mask(
@@ -104,6 +218,12 @@ class JEPA(nn.Module):
         m_task_mode: str = "eps",
         m_task_topk: int = 4,
         m_task_assume_normalized: bool = True,
+        pool_mode: str = "avg",
+        include_global_token: bool = False,
+        pos_mode: str = "learned",
+        encoder_hidden_dim: int | None = None,
+        embed_dim: int = 192,
+        aux_nibble: bool = False,
     ):
         super().__init__()
 
@@ -120,12 +240,43 @@ class JEPA(nn.Module):
         self.m_task_mode = m_task_mode
         self.m_task_topk = int(m_task_topk)
         self.m_task_assume_normalized = bool(m_task_assume_normalized)
+        self.pool_mode = str(pool_mode)
+        self.include_global_token = bool(include_global_token)
+        self.pos_mode = str(pos_mode)
+        self.aux_nibble = bool(aux_nibble)
+        self.embed_dim = int(embed_dim)
+
+        hidden = encoder_hidden_dim
+        if hidden is None:
+            hidden = getattr(getattr(encoder, "config", None), "hidden_size", None)
+        self.query_pool = None
+        if self.pool_mode == "query" and self.num_spatial_tokens > 1:
+            self.query_pool = SpatialQueryPool(
+                hidden_dim=int(hidden),
+                num_queries=self.num_spatial_tokens,
+                spatial_grid=self.spatial_grid,
+            )
+        n_class = self.spatial_grid * self.spatial_grid
+        if self.aux_nibble:
+            self.nibble_hi_head = nn.Linear(self.embed_dim, n_class)
+            self.nibble_lo_head = nn.Linear(self.embed_dim, n_class)
+        else:
+            self.nibble_hi_head = None
+            self.nibble_lo_head = None
 
     @property
     def use_spatial_tokens(self) -> bool:
         token_mode = getattr(self, "token_mode", "cls")
         n = int(getattr(self, "num_spatial_tokens", 1))
         return token_mode in ("spatial16", "spatial") and n > 1
+
+    @property
+    def num_tokens(self) -> int:
+        if not self.use_spatial_tokens:
+            return 1
+        return int(self.num_spatial_tokens) + int(
+            getattr(self, "include_global_token", False)
+        )
 
     def _pool_patches_to_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         """patch_tokens: (BT, P, H) -> (BT, N, H) with N = spatial_grid**2."""
@@ -136,6 +287,13 @@ class JEPA(nn.Module):
         g = int(getattr(self, "spatial_grid", 4))
         pooled = F.adaptive_avg_pool2d(grid, (g, g))
         return rearrange(pooled, "bt d gh gw -> bt (gh gw) d")
+
+    def _dummy_nibble(self, bt: int, n: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n_hi = torch.arange(n, device=device).view(1, n).expand(bt, -1)
+        g = int(self.spatial_grid)
+        center = (g // 2) * g + (g // 2)
+        n_lo = torch.full((bt, n), center, device=device, dtype=torch.long)
+        return n_hi, n_lo, n_hi.clone()
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -150,12 +308,37 @@ class JEPA(nn.Module):
         hidden = output.last_hidden_state
 
         if self.use_spatial_tokens:
-            patch_tokens = hidden[:, 1:]  # drop CLS
-            tokens = self._pool_patches_to_tokens(patch_tokens)  # (BT, N, H)
+            cls = hidden[:, :1]
+            patch_tokens = hidden[:, 1:]
+            attn = None
+            pool_mode = getattr(self, "pool_mode", "avg")
+            query_pool = getattr(self, "query_pool", None)
+            include_global = getattr(self, "include_global_token", False)
+            if pool_mode == "query" and query_pool is not None:
+                slots, attn = query_pool(patch_tokens)
+                n_hi, n_lo, n_hi_content = nibble_codes_from_attn(
+                    attn, spatial_grid=self.spatial_grid
+                )
+            else:
+                slots = self._pool_patches_to_tokens(patch_tokens)
+                n_hi, n_lo, n_hi_content = self._dummy_nibble(
+                    slots.size(0), slots.size(1), slots.device
+                )
+
+            if include_global:
+                tokens = torch.cat([cls, slots], dim=1)
+            else:
+                tokens = slots
+
             n = tokens.size(1)
             emb = self.projector(rearrange(tokens, "bt n d -> (bt n) d"))
             emb = rearrange(emb, "(bt n) d -> bt n d", n=n)
             info["emb"] = rearrange(emb, "(b t) n d -> b t n d", b=b)
+            info["n_hi"] = rearrange(n_hi, "(b t) n -> b t n", b=b)
+            info["n_lo"] = rearrange(n_lo, "(b t) n -> b t n", b=b)
+            info["n_hi_content"] = rearrange(n_hi_content, "(b t) n -> b t n", b=b)
+            if attn is not None:
+                info["slot_attn"] = rearrange(attn, "(b t) n p -> b t n p", b=b)
         else:
             pixels_emb = hidden[:, 0]  # cls token
             emb = self.projector(pixels_emb)
@@ -166,12 +349,12 @@ class JEPA(nn.Module):
 
         return info
 
-    def predict(self, emb, act_emb):
+    def predict(self, emb, act_emb, n_hi=None, n_lo=None):
         """Predict next state embedding
         emb: (B, T, D) or (B, T, N, D)
         act_emb: (B, T, A_emb)
         """
-        preds = self.predictor(emb, act_emb)
+        preds = self.predictor(emb, act_emb, n_hi=n_hi, n_lo=n_lo)
         if preds.ndim == 4:
             b, t, n, _ = preds.shape
             preds = self.pred_proj(rearrange(preds, "b t n d -> (b t n) d"))
@@ -180,6 +363,15 @@ class JEPA(nn.Module):
             preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
             preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
         return preds
+
+    def nibble_logits(self, pred_emb: torch.Tensor):
+        """pred_emb: (B, T, N, D) -> hi/lo logits over spatial slots."""
+        if self.nibble_hi_head is None or self.nibble_lo_head is None:
+            return None, None
+        slots = pred_emb
+        if getattr(self, "include_global_token", False):
+            slots = pred_emb[:, :, 1:, :]
+        return self.nibble_hi_head(slots), self.nibble_lo_head(slots)
 
     ####################
     ## Inference only ##
@@ -211,13 +403,31 @@ class JEPA(nn.Module):
         act = rearrange(act_0, "b s ... -> (b s) ...")
         act_future = rearrange(act_future, "b s ... -> (b s) ...")
 
+        n_hi = n_lo = None
+        if "n_hi" in _init and "n_lo" in _init:
+            n_hi = rearrange(
+                _init["n_hi"].unsqueeze(1).expand(B, S, *_init["n_hi"].shape[1:]),
+                "b s ... -> (b s) ...",
+            ).clone()
+            n_lo = rearrange(
+                _init["n_lo"].unsqueeze(1).expand(B, S, *_init["n_lo"].shape[1:]),
+                "b s ... -> (b s) ...",
+            ).clone()
+
         HS = history_size
         for t in range(n_steps):
             act_emb = self.action_encoder(act)
             emb_trunc = emb[:, -HS:]
             act_trunc = act_emb[:, -HS:]
-            pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
+            hi_trunc = n_hi[:, -HS:] if n_hi is not None else None
+            lo_trunc = n_lo[:, -HS:] if n_lo is not None else None
+            pred_emb = self.predict(
+                emb_trunc, act_trunc, n_hi=hi_trunc, n_lo=lo_trunc
+            )[:, -1:]
             emb = torch.cat([emb, pred_emb], dim=1)
+            if n_hi is not None:
+                n_hi = torch.cat([n_hi, n_hi[:, -1:]], dim=1)
+                n_lo = torch.cat([n_lo, n_lo[:, -1:]], dim=1)
 
             next_act = act_future[:, t : t + 1, :]
             act = torch.cat([act, next_act], dim=1)
@@ -226,12 +436,30 @@ class JEPA(nn.Module):
         act_emb = self.action_encoder(act)
         emb_trunc = emb[:, -HS:]
         act_trunc = act_emb[:, -HS:]
-        pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
+        hi_trunc = n_hi[:, -HS:] if n_hi is not None else None
+        lo_trunc = n_lo[:, -HS:] if n_lo is not None else None
+        pred_emb = self.predict(
+            emb_trunc, act_trunc, n_hi=hi_trunc, n_lo=lo_trunc
+        )[:, -1:]
         emb = torch.cat([emb, pred_emb], dim=1)
 
         pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
         info["predicted_emb"] = pred_rollout
         return info
+
+    def _pad_m_task(self, m_task: torch.Tensor, device) -> torch.Tensor:
+        mask = m_task.to(device).float()
+        n_slots = int(self.num_spatial_tokens)
+        if (
+            getattr(self, "include_global_token", False)
+            and mask.ndim >= 1
+            and mask.size(-1) == n_slots
+        ):
+            ones_shape = list(mask.shape)
+            ones_shape[-1] = 1
+            ones = torch.ones(*ones_shape, device=mask.device, dtype=mask.dtype)
+            mask = torch.cat([ones, mask], dim=-1)
+        return mask
 
     def criterion(self, info_dict: dict):
         """Compute the cost between predicted embeddings and goal embeddings."""
@@ -255,7 +483,7 @@ class JEPA(nn.Module):
             cost_mode = getattr(self, "cost_mode", "dense_terminal")
             if cost_mode == "m_task_terminal" and m_task is not None:
                 # m_task: (B, N) -> (B, 1, 1, N); mean over masked tokens
-                mask = m_task.to(per_tok.device).float()
+                mask = self._pad_m_task(m_task, per_tok.device)
                 if mask.ndim == 2:
                     mask = mask[:, None, None, :]
                 weighted = (per_tok * mask).sum(dim=(2, 3))  # (B, S)

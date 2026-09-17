@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - lewm_wall_s2
+  - _self_
+
+# S3：S2 + 双 nibble CE 辅助损失。S2 正向后再训。
+output_model_name: lewm_wall_s3
+subdir: ${output_model_name}_${now:%Y%m%d_%H%M%S}
+
+loss:
+  nibble:
+    weight: 0.05

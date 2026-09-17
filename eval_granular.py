@@ -445,6 +445,11 @@ def parse_args():
     p.add_argument("--token-mode", default="cls", choices=["cls", "spatial16", "spatial"])
     p.add_argument("--num-spatial-tokens", type=int, default=16)
     p.add_argument("--spatial-grid", type=int, default=4)
+    p.add_argument("--pool-mode", default="avg", choices=["avg", "query"])
+    p.add_argument("--include-global-token", action="store_true")
+    p.add_argument("--pos-mode", default="learned", choices=["learned", "nibble"])
+    p.add_argument("--inject-every-layer", action="store_true")
+    p.add_argument("--aux-nibble", action="store_true")
     p.add_argument(
         "--cost-mode",
         default="dense_terminal",
@@ -585,6 +590,11 @@ def main():
         token_mode=args.token_mode,
         num_spatial_tokens=args.num_spatial_tokens,
         spatial_grid=args.spatial_grid,
+        pool_mode=args.pool_mode,
+        include_global_token=args.include_global_token,
+        pos_mode=args.pos_mode,
+        inject_every_layer=args.inject_every_layer,
+        aux_nibble=args.aux_nibble,
         cost_mode=args.cost_mode,
         m_task_threshold=args.m_task_threshold,
         m_task_mode=args.m_task_mode,

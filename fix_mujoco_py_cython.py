@@ -151,9 +151,28 @@ def _check_glew_headers() -> None:
     candidates = [
         Path("/usr/include/GL/glew.h"),
         Path("/usr/local/include/GL/glew.h"),
+        Path("/data/czx/le-wm/deps/sysroot/usr/include/GL/glew.h"),
+        Path("/data/czx/le-wm/deps/glew/include/GL/glew.h"),
+        ROOT.parent / "deps" / "sysroot" / "usr" / "include" / "GL" / "glew.h",
+        ROOT.parent / "deps" / "glew" / "include" / "GL" / "glew.h",
     ]
-    if any(p.is_file() for p in candidates):
-        print(f"[INFO] 找到 GLEW 头文件")
+    found = next((p for p in candidates if p.is_file()), None)
+    if found is not None:
+        include_root = found.parent.parent  # .../include
+        lib_root = include_root.parent / "lib" / "x86_64-linux-gnu"
+        for key in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH"):
+            cur = os.environ.get(key, "")
+            parts = [p for p in cur.split(os.pathsep) if p]
+            if str(include_root) not in parts:
+                os.environ[key] = os.pathsep.join([str(include_root), *parts])
+        if lib_root.is_dir():
+            for key in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
+                cur = os.environ.get(key, "")
+                parts = [p for p in cur.split(os.pathsep) if p]
+                if str(lib_root) not in parts:
+                    os.environ[key] = os.pathsep.join([str(lib_root), *parts])
+        os.environ["CFLAGS"] = f"-I{include_root} " + os.environ.get("CFLAGS", "")
+        print(f"[INFO] 找到 GLEW 头文件: {found}")
         return
     raise SystemExit(
         "缺少 GLEW 开发头文件 (GL/glew.h)，mujoco_py 无法编译 eglshim.c。\n"

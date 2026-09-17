@@ -180,15 +180,22 @@ class Transformer(nn.Module):
                 block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
             )
 
-    def forward(self, x, c=None, attn_mask=None):
+    def forward(self, x, c=None, attn_mask=None, pe=None, inject_every_layer=False):
 
         if hasattr(self, "input_proj"):
             x = self.input_proj(x)
+            if pe is not None:
+                pe = self.input_proj(pe)
 
         if c is not None and hasattr(self, "cond_proj"):
             c = self.cond_proj(c)
 
+        if pe is not None and not inject_every_layer:
+            x = x + pe
+
         for block in self.layers:
+            if pe is not None and inject_every_layer:
+                x = x + pe
             if isinstance(block, Block):
                 x = block(x, attn_mask=attn_mask)
             else:
@@ -262,6 +269,100 @@ def block_causal_attn_mask(num_frames: int, num_spatial: int, device, dtype):
     return mask.masked_fill(~allow, torch.finfo(dtype).min)
 
 
+class NibblePE(nn.Module):
+    """Tokenization-aligned two-scale (radix-16) position encoding.
+
+    High nibble = 4x4 slot id, low nibble = 4x4 offset inside the slot.
+    Both scales share the same 4x4 row/col embeddings.
+    """
+
+    def __init__(self, dim: int, spatial_grid: int = 4, include_global: bool = True):
+        super().__init__()
+        self.dim = int(dim)
+        self.spatial_grid = int(spatial_grid)
+        g = self.spatial_grid
+        self.row_embed = nn.Embedding(g, dim)
+        self.col_embed = nn.Embedding(g, dim)
+        self.mlp_coarse = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.mlp_fine = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.include_global = bool(include_global)
+        self.global_embed = (
+            nn.Parameter(torch.zeros(1, 1, 1, dim)) if self.include_global else None
+        )
+        rel = 2 * (g - 1) + 1
+        self.rel_span = g - 1
+        self.b_coarse = nn.Parameter(torch.zeros(rel, rel))
+        self.b_fine = nn.Parameter(torch.zeros(rel, rel))
+
+    def cell_embed(self, row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
+        return self.row_embed(row) + self.col_embed(col)
+
+    def absolute(self, n_hi: torch.Tensor, n_lo: torch.Tensor) -> torch.Tensor:
+        g = self.spatial_grid
+        row_h, col_h = n_hi // g, n_hi % g
+        row_l, col_l = n_lo // g, n_lo % g
+        return self.mlp_coarse(self.cell_embed(row_h, col_h)) + self.mlp_fine(
+            self.cell_embed(row_l, col_l)
+        )
+
+    def relative_bias(self, n_hi: torch.Tensor, n_lo: torch.Tensor, num_tokens: int):
+        """Additive spatial bias (B, TN, TN). Global token (index 0) gets 0."""
+        B, T, S = n_hi.shape
+        g = self.spatial_grid
+        N = int(num_tokens)
+        include_global = N == S + 1
+        device = n_hi.device
+        fill = torch.full((B, T, N), -1, device=device, dtype=torch.long)
+        r_hi = fill.clone()
+        c_hi = fill.clone()
+        r_lo = fill.clone()
+        c_lo = fill.clone()
+        slot = slice(1, None) if include_global else slice(None)
+        r_hi[:, :, slot] = n_hi // g
+        c_hi[:, :, slot] = n_hi % g
+        r_lo[:, :, slot] = n_lo // g
+        c_lo[:, :, slot] = n_lo % g
+
+        def _pair_delta(coord):
+            flat = coord.reshape(B, T * N)
+            return flat[:, :, None] - flat[:, None, :]
+
+        d_rh = _pair_delta(r_hi)
+        d_ch = _pair_delta(c_hi)
+        d_rl = _pair_delta(r_lo)
+        d_cl = _pair_delta(c_lo)
+        valid = (r_hi.reshape(B, T * N)[:, :, None] >= 0) & (
+            r_hi.reshape(B, T * N)[:, None, :] >= 0
+        )
+        same = (
+            n_hi.reshape(B, T * S)[:, :, None] == n_hi.reshape(B, T * S)[:, None, :]
+        )
+        # same-cell over slots, then scatter into TN x TN if a global token exists
+        if include_global:
+            same_full = torch.zeros(
+                B, T * N, T * N, device=device, dtype=torch.bool
+            )
+            # compare only slot-slot pairs; layout per frame is [g, s0, ..., s15]
+            slot_idx = []
+            for t in range(T):
+                slot_idx.extend(range(t * N + 1, t * N + N))
+            idx = torch.tensor(slot_idx, device=device)
+            same_full[:, idx[:, None], idx[None, :]] = same
+        else:
+            same_full = same
+
+        span = self.rel_span
+        def _lookup(table, dr, dc):
+            rr = dr.clamp(-span, span) + span
+            cc = dc.clamp(-span, span) + span
+            return table[rr, cc]
+
+        bias = _lookup(self.b_coarse, d_rh, d_ch) + same_full.to(
+            dtype=self.b_fine.dtype
+        ) * _lookup(self.b_fine, d_rl, d_cl)
+        return torch.where(valid, bias, torch.zeros_like(bias))
+
+
 class ARPredictor(nn.Module):
     """Autoregressive predictor for next-step embedding prediction.
 
@@ -283,17 +384,33 @@ class ARPredictor(nn.Module):
         dropout=0.0,
         emb_dropout=0.0,
         num_spatial_tokens: int = 1,
+        pos_mode: str = "learned",
+        include_global_token: bool = False,
+        inject_every_layer: bool = False,
+        spatial_grid: int = 4,
     ):
         super().__init__()
         self.num_frames = num_frames
         self.num_spatial_tokens = int(num_spatial_tokens)
+        self.pos_mode = str(pos_mode)
+        self.include_global_token = bool(include_global_token)
+        self.inject_every_layer = bool(inject_every_layer)
+        self.spatial_grid = int(spatial_grid)
         self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
-        if self.num_spatial_tokens > 1:
+        use_learned_spatial = self.num_spatial_tokens > 1 and self.pos_mode != "nibble"
+        if use_learned_spatial:
             self.spatial_pos_embedding = nn.Parameter(
                 torch.randn(1, 1, self.num_spatial_tokens, input_dim)
             )
         else:
             self.spatial_pos_embedding = None
+        self.nibble_pe = None
+        if self.pos_mode == "nibble" and self.num_spatial_tokens > 1:
+            self.nibble_pe = NibblePE(
+                dim=input_dim,
+                spatial_grid=self.spatial_grid,
+                include_global=self.include_global_token,
+            )
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             input_dim,
@@ -307,7 +424,14 @@ class ARPredictor(nn.Module):
             block_class=ConditionalBlock,
         )
 
-    def forward(self, x, c):
+    def _fallback_nibble(self, batch, time, slots, device):
+        g = self.spatial_grid
+        n_hi = torch.arange(slots, device=device).view(1, 1, slots).expand(batch, time, -1)
+        center = (g // 2) * g + (g // 2)
+        n_lo = torch.full((batch, time, slots), center, device=device, dtype=torch.long)
+        return n_hi, n_lo
+
+    def forward(self, x, c, n_hi=None, n_lo=None):
         """
         x: (B, T, d) or (B, T, N, d)
         c: (B, T, act_dim)
@@ -319,14 +443,43 @@ class ARPredictor(nn.Module):
                 f"expected {self.num_spatial_tokens} spatial tokens, got {N}"
             )
             x = x + self.pos_embedding[:, :T, None, :]
-            if self.spatial_pos_embedding is not None:
+            extra_pe = None
+            attn_mask = block_causal_attn_mask(T, N, x.device, x.dtype)
+            pos_mode = getattr(self, "pos_mode", "learned")
+            nibble_pe = getattr(self, "nibble_pe", None)
+            include_global = getattr(self, "include_global_token", False)
+            inject_every_layer = getattr(self, "inject_every_layer", False)
+            if pos_mode == "nibble" and nibble_pe is not None:
+                n_slots = N - int(include_global)
+                if n_hi is None or n_lo is None:
+                    n_hi, n_lo = self._fallback_nibble(B, T, n_slots, x.device)
+                pe_slots = nibble_pe.absolute(n_hi, n_lo)
+                if include_global:
+                    gpe = nibble_pe.global_embed.expand(B, T, 1, D)
+                    extra_pe = torch.cat([gpe, pe_slots], dim=2)
+                else:
+                    extra_pe = pe_slots
+                rel = nibble_pe.relative_bias(n_hi, n_lo, num_tokens=N)
+                attn_mask = attn_mask.unsqueeze(0) + rel
+                attn_mask = attn_mask.unsqueeze(1)
+            elif self.spatial_pos_embedding is not None:
                 x = x + self.spatial_pos_embedding[:, :, :N, :]
+
             c = c.unsqueeze(2).expand(-1, -1, N, -1)
             x = rearrange(x, "b t n d -> b (t n) d")
             c = rearrange(c, "b t n d -> b (t n) d")
-            attn_mask = block_causal_attn_mask(T, N, x.device, x.dtype)
+            if extra_pe is not None:
+                extra_pe = rearrange(extra_pe, "b t n d -> b (t n) d")
             x = self.dropout(x)
-            x = self.transformer(x, c, attn_mask=attn_mask)
+            if extra_pe is not None:
+                extra_pe = self.dropout(extra_pe)
+            x = self.transformer(
+                x,
+                c,
+                attn_mask=attn_mask,
+                pe=extra_pe,
+                inject_every_layer=inject_every_layer and extra_pe is not None,
+            )
             return rearrange(x, "b (t n) d -> b t n d", t=T, n=N)
 
         T = x.size(1)

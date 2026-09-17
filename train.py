@@ -43,7 +43,11 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_act = act_emb[:, : ctx_len]
 
     tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+    n_hi = output.get("n_hi")
+    n_lo = output.get("n_lo")
+    hi_ctx = n_hi[:, :ctx_len] if n_hi is not None else None
+    lo_ctx = n_lo[:, :ctx_len] if n_lo is not None else None
+    pred_emb = self.model.predict(ctx_emb, ctx_act, n_hi=hi_ctx, n_lo=lo_ctx)
 
     # LeWM loss (ordinary token MSE — dense over all spatial tokens when N>1)
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
@@ -54,6 +58,26 @@ def lejepa_forward(self, batch, stage, cfg):
         sigreg_in = emb.transpose(0, 1)
     output["sigreg_loss"] = self.sigreg(sigreg_in)
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+    nibble_cfg = cfg.loss.get("nibble", None) if cfg.get("loss") is not None else None
+    nibble_w = float(nibble_cfg.weight) if nibble_cfg is not None else 0.0
+    if nibble_w > 0 and n_lo is not None and pred_emb.ndim == 4:
+        logits_hi, logits_lo = self.model.nibble_logits(pred_emb)
+        if logits_hi is not None:
+            tgt_hi = output.get("n_hi_content", n_hi)[:, n_preds:]
+            tgt_lo = n_lo[:, n_preds:]
+            ce_hi = torch.nn.functional.cross_entropy(
+                logits_hi.reshape(-1, logits_hi.size(-1)),
+                tgt_hi.reshape(-1).long(),
+            )
+            ce_lo = torch.nn.functional.cross_entropy(
+                logits_lo.reshape(-1, logits_lo.size(-1)),
+                tgt_lo.reshape(-1).long(),
+            )
+            output["nibble_hi_loss"] = ce_hi
+            output["nibble_lo_loss"] = ce_lo
+            output["nibble_loss"] = ce_hi + ce_lo
+            output["loss"] = output["loss"] + nibble_w * output["nibble_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, on_epoch=True, sync_dist=True)
@@ -97,6 +121,7 @@ def run(cfg):
 
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
     plan_cfg = cfg.get("plan") or {}
+    nibble_cfg = cfg.loss.get("nibble", None) if cfg.get("loss") is not None else None
     world_model = build_lewm(
         action_dim=effective_act_dim,
         history_size=cfg.wm.history_size,
@@ -113,6 +138,11 @@ def run(cfg):
         m_task_mode=str(plan_cfg.get("m_task_mode", "eps")),
         m_task_topk=int(plan_cfg.get("m_task_topk", 4)),
         m_task_assume_normalized=bool(plan_cfg.get("m_task_assume_normalized", True)),
+        pool_mode=str(cfg.wm.get("pool_mode", "avg")),
+        include_global_token=bool(cfg.wm.get("include_global_token", False)),
+        pos_mode=str(cfg.wm.get("pos_mode", "learned")),
+        inject_every_layer=bool(cfg.wm.get("inject_every_layer", False)),
+        aux_nibble=bool(nibble_cfg is not None and float(nibble_cfg.get("weight", 0.0)) > 0),
     )
     optimizers = {
         'model_opt': {
@@ -178,11 +208,14 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
+    weights_ckpt = run_dir / f"{cfg.output_model_name}_weights.ckpt"
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=run_dir / f"{cfg.output_model_name}_weights.ckpt",
+        # Only resume when the weights file already exists; otherwise train
+        # from scratch (Manager refuses a missing ckpt_path).
+        ckpt_path=str(weights_ckpt.resolve()) if weights_ckpt.is_file() else None,
     )
 
     manager()

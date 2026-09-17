@@ -25,7 +25,7 @@ checkpoint:
 
 trainer:
   max_epochs: 100
-  devices: [5, 6]
+  devices: [0, 1]
   accelerator: gpu
   strategy: ddp
   precision: bf16-mixed

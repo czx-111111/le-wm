@@ -21,11 +21,51 @@ def aggregate_dct(dcts):
     return full_dct
 
 
+class _CompatResize(dt.transforms.Resize):
+    """SPT Resize calls ``self.transform``; torchvision>=0.20 renamed it to ``_transform``."""
+
+    def __call__(self, x):
+        img = self.nested_get(x, self.source)
+        if hasattr(self, "transform"):
+            out = self.transform(img, [])
+        else:
+            params = self.make_params([]) if hasattr(self, "make_params") else {}
+            out = self._transform(img, params)
+        self.nested_set(x, out, self.target)
+        return x
+
+
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
-    imagenet_stats = dt.dataset_stats.ImageNet
-    to_image = dt.transforms.ToImage(**imagenet_stats, source=source, target=target)
-    resize = dt.transforms.Resize(img_size, source=source, target=target)
-    return dt.transforms.Compose(to_image, resize)
+    """ImageNet-normalize CHW tensors from HDF5 (already permuted, often float 0-255).
+
+    Avoids SPT ``ToImage``+``Resize`` which break on torchvision>=0.20 and on
+    pre-permuted CHW batches.
+    """
+    stats = dt.dataset_stats.ImageNet
+    mean = torch.tensor(stats["mean"], dtype=torch.float32).view(1, 3, 1, 1)
+    std = torch.tensor(stats["std"], dtype=torch.float32).view(1, 3, 1, 1)
+
+    def _norm(x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        # HDF5 path already returns (T, C, H, W); keep a HWC fallback just in case.
+        if x.ndim >= 3 and x.shape[-1] in (1, 3) and x.shape[-3] not in (1, 3):
+            x = x.movedim(-1, -3)
+        if img_size is not None and tuple(x.shape[-2:]) != (img_size, img_size):
+            batched = x.ndim == 4
+            y = x if batched else x.unsqueeze(0)
+            y = torch.nn.functional.interpolate(
+                y, size=(img_size, img_size), mode="bilinear", align_corners=False
+            )
+            x = y if batched else y.squeeze(0)
+        if x.max() > 1.5:
+            x = x / 255.0
+        m = mean.to(device=x.device, dtype=x.dtype)
+        s = std.to(device=x.device, dtype=x.dtype)
+        if x.ndim == 3:
+            m, s = m[0], s[0]
+        return (x - m) / s
+
+    return dt.transforms.WrapTorchTransform(_norm, source=source, target=target)
 
 
 def get_column_normalizer(dataset, source: str, target: str):
@@ -174,8 +214,13 @@ def build_lewm(
     m_task_mode: str = "eps",
     m_task_topk: int = 4,
     m_task_assume_normalized: bool = True,
+    pool_mode: str = "avg",
+    include_global_token: bool = False,
+    pos_mode: str = "learned",
+    inject_every_layer: bool = False,
+    aux_nibble: bool = False,
 ):
-    """Construct a JEPA world model (CLS or C1 spatial-16)."""
+    """Construct a JEPA world model (CLS, C1 spatial-16, or S1 query readout)."""
     import stable_pretraining as spt
     from jepa import JEPA
     from module import ARPredictor, Embedder, MLP
@@ -203,13 +248,19 @@ def build_lewm(
     n_spatial = int(num_spatial_tokens)
     if token_mode in ("spatial16", "spatial"):
         n_spatial = max(n_spatial, spatial_grid * spatial_grid)
+    include_global = bool(include_global_token) and token_mode in ("spatial16", "spatial")
+    n_seq = n_spatial + int(include_global) if token_mode in ("spatial16", "spatial") else 1
 
     predictor = ARPredictor(
         num_frames=history_size,
         input_dim=embed_dim,
         hidden_dim=hidden_dim,
         output_dim=hidden_dim,
-        num_spatial_tokens=n_spatial if token_mode in ("spatial16", "spatial") else 1,
+        num_spatial_tokens=n_seq,
+        pos_mode=pos_mode,
+        include_global_token=include_global,
+        inject_every_layer=bool(inject_every_layer),
+        spatial_grid=spatial_grid,
         **pred_kwargs,
     )
 
@@ -245,4 +296,10 @@ def build_lewm(
         m_task_mode=m_task_mode,
         m_task_topk=m_task_topk,
         m_task_assume_normalized=m_task_assume_normalized,
+        pool_mode=pool_mode,
+        include_global_token=include_global,
+        pos_mode=pos_mode,
+        encoder_hidden_dim=hidden_dim,
+        embed_dim=embed_dim,
+        aux_nibble=bool(aux_nibble),
     )
