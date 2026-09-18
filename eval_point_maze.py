@@ -533,6 +533,7 @@ def load_lewm_model(
     include_global_token: bool = False,
     pos_mode: str = "learned",
     inject_every_layer: bool = False,
+    n_lo_mode: str = "attn",
     aux_nibble: bool = False,
 ):
     # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
@@ -557,6 +558,10 @@ def load_lewm_model(
             model.include_global_token = False
         if not hasattr(model, "pos_mode"):
             model.pos_mode = "learned"
+        model.n_lo_mode = n_lo_mode
+        if hasattr(model, "predictor"):
+            model.predictor.n_lo_mode = n_lo_mode
+            model.predictor.inject_every_layer = inject_every_layer
         if token_mode != "cls" and getattr(model, "token_mode", "cls") != token_mode:
             print(
                 f"[WARN] ckpt token_mode={model.token_mode} "
@@ -589,6 +594,7 @@ def load_lewm_model(
             include_global_token=include_global_token,
             pos_mode=pos_mode,
             inject_every_layer=inject_every_layer,
+            n_lo_mode=n_lo_mode,
             aux_nibble=aux_nibble,
         )
         model = load_lewm_weights_into_model(model, ckpt_path)
@@ -604,7 +610,8 @@ def load_lewm_model(
         f"num_spatial_tokens={getattr(model, 'num_spatial_tokens', 1)} "
         f"pool_mode={getattr(model, 'pool_mode', 'avg')} "
         f"include_global={getattr(model, 'include_global_token', False)} "
-        f"pos_mode={getattr(model, 'pos_mode', 'learned')}"
+        f"pos_mode={getattr(model, 'pos_mode', 'learned')} "
+        f"n_lo_mode={getattr(model, 'n_lo_mode', 'attn')}"
     )
 
     model.eval()
@@ -897,6 +904,7 @@ def evaluate(args):
         include_global_token=args.include_global_token,
         pos_mode=args.pos_mode,
         inject_every_layer=args.inject_every_layer,
+        n_lo_mode=args.n_lo_mode,
         aux_nibble=args.aux_nibble,
         cost_mode=args.cost_mode,
         m_task_threshold=args.m_task_threshold,
@@ -1101,6 +1109,12 @@ def parse_args():
     p.add_argument("--include-global-token", action="store_true")
     p.add_argument("--pos-mode", default="learned", choices=["learned", "nibble"])
     p.add_argument("--inject-every-layer", action="store_true")
+    p.add_argument(
+        "--n-lo-mode",
+        default="attn",
+        choices=["attn", "fixed_center"],
+        help="attn=注意力质心细码；fixed_center=锁格子中心",
+    )
     p.add_argument("--aux-nibble", action="store_true")
     p.add_argument(
         "--cost-mode",

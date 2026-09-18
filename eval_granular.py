@@ -449,6 +449,12 @@ def parse_args():
     p.add_argument("--include-global-token", action="store_true")
     p.add_argument("--pos-mode", default="learned", choices=["learned", "nibble"])
     p.add_argument("--inject-every-layer", action="store_true")
+    p.add_argument(
+        "--n-lo-mode",
+        default="attn",
+        choices=["attn", "fixed_center"],
+        help="attn=注意力质心细码；fixed_center=锁格子中心",
+    )
     p.add_argument("--aux-nibble", action="store_true")
     p.add_argument(
         "--cost-mode",
@@ -594,6 +600,7 @@ def main():
         include_global_token=args.include_global_token,
         pos_mode=args.pos_mode,
         inject_every_layer=args.inject_every_layer,
+        n_lo_mode=args.n_lo_mode,
         aux_nibble=args.aux_nibble,
         cost_mode=args.cost_mode,
         m_task_threshold=args.m_task_threshold,

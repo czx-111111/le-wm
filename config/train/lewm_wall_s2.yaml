@@ -3,10 +3,12 @@ defaults:
   - lewm_wall_s1
   - _self_
 
-# S2：在 S1 读出上换 NibblePE（每层注入 + 分级相对偏置）。S1 出结果后再训。
+# S2 消融：NibblePE + 逐层注入；n_lo 锁格子中心（去掉动态细码噪声）。
+# 读出仍为 query+CLS；无 nibble CE。从零训。
 output_model_name: lewm_wall_s2
 subdir: ${output_model_name}_${now:%Y%m%d_%H%M%S}
 
 wm:
   pos_mode: nibble
   inject_every_layer: true
+  n_lo_mode: fixed_center

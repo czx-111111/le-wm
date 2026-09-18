@@ -34,7 +34,7 @@
 |------|--------|----------|----------|
 | **C1（对照）** | 4×4 avg pool → 16 token；评估 `M_task` | 训练 dense MSE | `lewm_*_c1.yaml` |
 | **S1** | CLS + 16 query 替换 avg pool | PE 仍为「加一次」learned；无辅助 CE | `lewm_*_s1.yaml` |
-| **S2** | NibblePE + 分级相对偏置 + 可选每层注入 | 读出冻结为 S1；无辅助 CE | `lewm_wall_s2.yaml` |
+| **S2** | NibblePE + 分级相对偏置 + 每层注入；`n_lo` 默认锁格子中心（消融） | 读出冻结为 S1；无辅助 CE | `lewm_wall_s2.yaml` |
 | **S3** | 双 nibble CE 辅助损失 | 主损失仍是 dense MSE | `lewm_wall_s3.yaml` |
 
 ```
@@ -47,7 +47,7 @@ ViT (197 = 1 CLS + 196 patch)
                  → 17 tokens (global + slots)
                         │
                         ├─ S1: learned PE（输入加一次）
-                        ├─ S2: NibblePE（绝对 + 相对偏置，可每层注入）
+                        ├─ S2: NibblePE（绝对 + 相对偏置；可每层注入；可选固定 n_lo）
                         └─ S3: + CE(n_hi) + CE(n_lo)
                         │
                         ▼
@@ -233,10 +233,20 @@ e_{\mathrm{cell}}(u,v) = E_{\mathrm{row}}[u] + E_{\mathrm{col}}[v]
 
 加到 block-causal mask 上（实现见 `ARPredictor.forward`）。
 
-### 4.4 每层注入
+### 4.4 每层注入与固定 `n_lo`（当前 S2 默认）
 
-S1：**禁止**每层注入（避免与读出改动纠缠）。  
-S2：`inject_every_layer: true` 时，在 Transformer 每层前把 NibblePE 向量再加一次（`module.Transformer` 的 `pe` / `inject_every_layer`）。
+当前 S2 消融默认：
+
+- `inject_every_layer: true`：Transformer 每层前再加一次 NibblePE。
+- `n_lo_mode: fixed_center`：低 nibble 锁在每个粗槽 4×4 细格的中心，不再用注意力质心。  
+  绝对 PE 只随槽身份变，用于检验「动态细码是否是噪声」。
+
+实现：
+
+- `JEPA.encode`：若 `n_lo_mode=fixed_center`，覆盖 `n_lo`。
+- `ARPredictor`：同模式下忽略传入的动态 `n_lo`，改用格子中心。
+
+恢复动态细码：`wm.n_lo_mode: attn`。关掉每层注入：`wm.inject_every_layer: false`。
 
 ### 4.5 配置
 
@@ -245,6 +255,7 @@ S2：`inject_every_layer: true` 时，在 Transformer 每层前把 NibblePE 向�
 wm:
   pos_mode: nibble
   inject_every_layer: true
+  n_lo_mode: fixed_center
 ```
 
 训练：读出仍是 query+CLS；**损失仍无 nibble CE**。
@@ -369,6 +380,7 @@ loss:
 | `wm.include_global_token` | false | true | true | true |
 | `wm.pos_mode` | learned | learned | **nibble** | nibble |
 | `wm.inject_every_layer` | false | false | **true** | true |
+| `wm.n_lo_mode` | — | — | **fixed_center** | fixed_center / attn |
 | `loss.nibble.weight` | — | — | — | **>0** |
 | `loss.m_dyn` | 无 | 无 | 无 | 无 |
 | `plan.cost_mode` | `m_task_terminal` | 同左 | 同左 | 同左 |

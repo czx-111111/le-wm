@@ -221,6 +221,7 @@ class JEPA(nn.Module):
         pool_mode: str = "avg",
         include_global_token: bool = False,
         pos_mode: str = "learned",
+        n_lo_mode: str = "attn",
         encoder_hidden_dim: int | None = None,
         embed_dim: int = 192,
         aux_nibble: bool = False,
@@ -243,6 +244,8 @@ class JEPA(nn.Module):
         self.pool_mode = str(pool_mode)
         self.include_global_token = bool(include_global_token)
         self.pos_mode = str(pos_mode)
+        # attn: centroid-quantized low nibble; fixed_center: lock to slot-cell center
+        self.n_lo_mode = str(n_lo_mode)
         self.aux_nibble = bool(aux_nibble)
         self.embed_dim = int(embed_dim)
 
@@ -295,6 +298,11 @@ class JEPA(nn.Module):
         n_lo = torch.full((bt, n), center, device=device, dtype=torch.long)
         return n_hi, n_lo, n_hi.clone()
 
+    def _fixed_center_n_lo(self, bt: int, n: int, device) -> torch.Tensor:
+        g = int(self.spatial_grid)
+        center = (g // 2) * g + (g // 2)
+        return torch.full((bt, n), center, device=device, dtype=torch.long)
+
     def encode(self, info):
         """Encode observations and actions into embeddings.
         info['pixels']: (B, T, C, H, W)
@@ -324,6 +332,11 @@ class JEPA(nn.Module):
                 n_hi, n_lo, n_hi_content = self._dummy_nibble(
                     slots.size(0), slots.size(1), slots.device
                 )
+            # Ablation: lock low nibble to cell center (structured slot PE only).
+            if getattr(self, "n_lo_mode", "attn") == "fixed_center":
+                n_lo = self._fixed_center_n_lo(
+                    slots.size(0), slots.size(1), slots.device
+                )
 
             if include_global:
                 tokens = torch.cat([cls, slots], dim=1)
@@ -334,9 +347,12 @@ class JEPA(nn.Module):
             emb = self.projector(rearrange(tokens, "bt n d -> (bt n) d"))
             emb = rearrange(emb, "(bt n) d -> bt n d", n=n)
             info["emb"] = rearrange(emb, "(b t) n d -> b t n d", b=b)
-            info["n_hi"] = rearrange(n_hi, "(b t) n -> b t n", b=b)
-            info["n_lo"] = rearrange(n_lo, "(b t) n -> b t n", b=b)
-            info["n_hi_content"] = rearrange(n_hi_content, "(b t) n -> b t n", b=b)
+            # discrete spatial codes for S2 NibblePE / S3 CE (no grad through round)
+            info["n_hi"] = rearrange(n_hi.detach(), "(b t) n -> b t n", b=b)
+            info["n_lo"] = rearrange(n_lo.detach(), "(b t) n -> b t n", b=b)
+            info["n_hi_content"] = rearrange(
+                n_hi_content.detach(), "(b t) n -> b t n", b=b
+            )
             if attn is not None:
                 info["slot_attn"] = rearrange(attn, "(b t) n p -> b t n p", b=b)
         else:

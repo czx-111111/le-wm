@@ -142,6 +142,7 @@ def run(cfg):
         include_global_token=bool(cfg.wm.get("include_global_token", False)),
         pos_mode=str(cfg.wm.get("pos_mode", "learned")),
         inject_every_layer=bool(cfg.wm.get("inject_every_layer", False)),
+        n_lo_mode=str(cfg.wm.get("n_lo_mode", "attn")),
         aux_nibble=bool(nibble_cfg is not None and float(nibble_cfg.get("weight", 0.0)) > 0),
     )
     optimizers = {

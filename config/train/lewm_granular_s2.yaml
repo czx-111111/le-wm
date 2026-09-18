@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - lewm_granular_s1
+  - _self_
+
+# S2 消融：NibblePE + 逐层注入；n_lo 锁格子中心（去掉动态细码噪声）。
+output_model_name: lewm_granular_s2
+subdir: ${output_model_name}_${now:%Y%m%d_%H%M%S}
+
+wm:
+  pos_mode: nibble
+  inject_every_layer: true
+  n_lo_mode: fixed_center

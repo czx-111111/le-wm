@@ -306,60 +306,49 @@ class NibblePE(nn.Module):
         )
 
     def relative_bias(self, n_hi: torch.Tensor, n_lo: torch.Tensor, num_tokens: int):
-        """Additive spatial bias (B, TN, TN). Global token (index 0) gets 0."""
+        """Additive spatial bias (B, TN, TN). Global token (index 0) gets 0.
+
+        Coarse Δ(R,C) always applies between slots. Fine Δ(r,c) only when
+        n_hi matches (same 4x4 cell); cross-slot fine term is gated to 0.
+        Never treat the packed byte as a 1D distance.
+        """
         B, T, S = n_hi.shape
         g = self.spatial_grid
         N = int(num_tokens)
         include_global = N == S + 1
         device = n_hi.device
-        fill = torch.full((B, T, N), -1, device=device, dtype=torch.long)
-        r_hi = fill.clone()
-        c_hi = fill.clone()
-        r_lo = fill.clone()
-        c_lo = fill.clone()
         slot = slice(1, None) if include_global else slice(None)
+
+        # (B, T, N) grids; global positions stay -1 and are zeroed via ``valid``.
+        r_hi = torch.full((B, T, N), -1, device=device, dtype=torch.long)
+        c_hi = r_hi.clone()
+        r_lo = r_hi.clone()
+        c_lo = r_hi.clone()
+        hi_id = r_hi.clone()
         r_hi[:, :, slot] = n_hi // g
         c_hi[:, :, slot] = n_hi % g
         r_lo[:, :, slot] = n_lo // g
         c_lo[:, :, slot] = n_lo % g
+        hi_id[:, :, slot] = n_hi
 
         def _pair_delta(coord):
             flat = coord.reshape(B, T * N)
             return flat[:, :, None] - flat[:, None, :]
 
-        d_rh = _pair_delta(r_hi)
-        d_ch = _pair_delta(c_hi)
-        d_rl = _pair_delta(r_lo)
-        d_cl = _pair_delta(c_lo)
-        valid = (r_hi.reshape(B, T * N)[:, :, None] >= 0) & (
-            r_hi.reshape(B, T * N)[:, None, :] >= 0
-        )
-        same = (
-            n_hi.reshape(B, T * S)[:, :, None] == n_hi.reshape(B, T * S)[:, None, :]
-        )
-        # same-cell over slots, then scatter into TN x TN if a global token exists
-        if include_global:
-            same_full = torch.zeros(
-                B, T * N, T * N, device=device, dtype=torch.bool
-            )
-            # compare only slot-slot pairs; layout per frame is [g, s0, ..., s15]
-            slot_idx = []
-            for t in range(T):
-                slot_idx.extend(range(t * N + 1, t * N + N))
-            idx = torch.tensor(slot_idx, device=device)
-            same_full[:, idx[:, None], idx[None, :]] = same
-        else:
-            same_full = same
+        flat_hi = hi_id.reshape(B, T * N)
+        valid = (flat_hi[:, :, None] >= 0) & (flat_hi[:, None, :] >= 0)
+        same_cell = (flat_hi[:, :, None] == flat_hi[:, None, :]) & valid
 
         span = self.rel_span
+
         def _lookup(table, dr, dc):
             rr = dr.clamp(-span, span) + span
             cc = dc.clamp(-span, span) + span
             return table[rr, cc]
 
-        bias = _lookup(self.b_coarse, d_rh, d_ch) + same_full.to(
-            dtype=self.b_fine.dtype
-        ) * _lookup(self.b_fine, d_rl, d_cl)
+        coarse = _lookup(self.b_coarse, _pair_delta(r_hi), _pair_delta(c_hi))
+        fine = _lookup(self.b_fine, _pair_delta(r_lo), _pair_delta(c_lo))
+        bias = coarse + same_cell.to(dtype=fine.dtype) * fine
         return torch.where(valid, bias, torch.zeros_like(bias))
 
 
@@ -387,6 +376,7 @@ class ARPredictor(nn.Module):
         pos_mode: str = "learned",
         include_global_token: bool = False,
         inject_every_layer: bool = False,
+        n_lo_mode: str = "attn",
         spatial_grid: int = 4,
     ):
         super().__init__()
@@ -395,6 +385,7 @@ class ARPredictor(nn.Module):
         self.pos_mode = str(pos_mode)
         self.include_global_token = bool(include_global_token)
         self.inject_every_layer = bool(inject_every_layer)
+        self.n_lo_mode = str(n_lo_mode)
         self.spatial_grid = int(spatial_grid)
         self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
         use_learned_spatial = self.num_spatial_tokens > 1 and self.pos_mode != "nibble"
@@ -451,8 +442,12 @@ class ARPredictor(nn.Module):
             inject_every_layer = getattr(self, "inject_every_layer", False)
             if pos_mode == "nibble" and nibble_pe is not None:
                 n_slots = N - int(include_global)
-                if n_hi is None or n_lo is None:
+                n_lo_mode = getattr(self, "n_lo_mode", "attn")
+                if n_lo_mode == "fixed_center" or n_hi is None or n_lo is None:
                     n_hi, n_lo = self._fallback_nibble(B, T, n_slots, x.device)
+                # discrete codes are indices only; keep them off the autograd graph
+                n_hi = n_hi.long().detach()
+                n_lo = n_lo.long().detach()
                 pe_slots = nibble_pe.absolute(n_hi, n_lo)
                 if include_global:
                     gpe = nibble_pe.global_embed.expand(B, T, 1, D)
@@ -460,7 +455,9 @@ class ARPredictor(nn.Module):
                 else:
                     extra_pe = pe_slots
                 rel = nibble_pe.relative_bias(n_hi, n_lo, num_tokens=N)
-                attn_mask = attn_mask.unsqueeze(0) + rel
+                # (TN,TN) causal + (B,TN,TN) relative -> (B,1,TN,TN) for SDPA
+                attn_mask = attn_mask.to(dtype=x.dtype)
+                attn_mask = attn_mask.unsqueeze(0) + rel.to(dtype=x.dtype)
                 attn_mask = attn_mask.unsqueeze(1)
             elif self.spatial_pos_embedding is not None:
                 x = x + self.spatial_pos_embedding[:, :, :N, :]
