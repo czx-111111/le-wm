@@ -219,9 +219,10 @@ def build_lewm(
     pos_mode: str = "learned",
     inject_every_layer: bool = False,
     n_lo_mode: str = "attn",
-    aux_nibble: bool = False,
+    use_relative_bias: bool = True,
+    abs_mode: str = "shared",
 ):
-    """Construct a JEPA world model (CLS / C1 / S1 query / S2 NibblePE / S3)."""
+    """Construct a JEPA world model (CLS / C1 / S1 query / S2 NibblePE)."""
     import stable_pretraining as spt
     from jepa import JEPA
     from module import ARPredictor, Embedder, MLP
@@ -262,6 +263,8 @@ def build_lewm(
         include_global_token=include_global,
         inject_every_layer=bool(inject_every_layer),
         n_lo_mode=str(n_lo_mode),
+        use_relative_bias=bool(use_relative_bias),
+        abs_mode=str(abs_mode),
         spatial_grid=spatial_grid,
         **pred_kwargs,
     )
@@ -304,5 +307,4 @@ def build_lewm(
         n_lo_mode=str(n_lo_mode),
         encoder_hidden_dim=hidden_dim,
         embed_dim=embed_dim,
-        aux_nibble=bool(aux_nibble),
     )

@@ -34,8 +34,8 @@
 |------|--------|----------|----------|
 | **C1（对照）** | 4×4 avg pool → 16 token；评估 `M_task` | 训练 dense MSE | `lewm_*_c1.yaml` |
 | **S1** | CLS + 16 query 替换 avg pool | PE 仍为「加一次」learned；无辅助 CE | `lewm_*_s1.yaml` |
-| **S2** | NibblePE + 分级相对偏置 + 每层注入；`n_lo` 默认锁格子中心（消融） | 读出冻结为 S1；无辅助 CE | `lewm_wall_s2.yaml` |
-| **S3** | 双 nibble CE 辅助损失 | 主损失仍是 dense MSE | `lewm_wall_s3.yaml` |
+| **S2（当前代码）** | 共享 4×4 NibblePE + 每层注入 + 动态 `n_lo`；相对偏置关闭 | 读出冻结为 S1；无辅助 CE | `lewm_*_s2.yaml` |
+| **S3（已移除）** | 曾在 S2 上加双 nibble CE | rope 上 0.05 / 0.005 都差于 S2，代码已退回 | — |
 
 ```
 ViT (197 = 1 CLS + 196 patch)
@@ -47,11 +47,10 @@ ViT (197 = 1 CLS + 196 patch)
                  → 17 tokens (global + slots)
                         │
                         ├─ S1: learned PE（输入加一次）
-                        ├─ S2: NibblePE（绝对 + 相对偏置；可每层注入；可选固定 n_lo）
-                        └─ S3: + CE(n_hi) + CE(n_lo)
+                        └─ S2: 共享 4×4 NibblePE（动态 n_lo + 每层注入；无相对偏置）
                         │
                         ▼
-              训练: dense MSE + λ·SIGReg（± nibble CE）
+              训练: dense MSE + λ·SIGReg
               规划: M_task on 16 slots；全局位固定参与 cost
 ```
 
@@ -59,7 +58,7 @@ ViT (197 = 1 CLS + 196 patch)
 
 ## 1. 公共基础：C1 与规划协议
 
-S1/S2/S3 都建立在 C1 协议上，先写清公共部分。
+S1/S2 都建立在 C1 协议上，先写清公共部分。S3 已从代码移除，见 §5。
 
 ### 1.1 C1 表示
 
@@ -82,7 +81,7 @@ S1+ 若含全局 token：mask 变为 `\mathrm{cat}([1], M_{\mathrm{task}}^{16})`
 
 ### 1.3 为何不把 C2 当主线
 
-C2 训练 mask 是潜空间相邻帧 \(\|z_{t+1}-z_t\| > \tau\)（`M_dyn`），与规划用的「相对 goal 的像素差」`M_task` **不是同一件事**；且 dense `pred_loss` 仍在，只是额外加权。实验上变差，故 **S1/S2/S3 全部不启用 `loss.m_dyn`**。
+C2 训练 mask 是潜空间相邻帧 \(\|z_{t+1}-z_t\| > \tau\)（`M_dyn`），与规划用的「相对 goal 的像素差」`M_task` **不是同一件事**；且 dense `pred_loss` 仍在，只是额外加权。实验上变差，故 **S1/S2 不启用 `loss.m_dyn`**。
 
 ---
 
@@ -110,7 +109,7 @@ tokens = cat([cls, slots], dim=1)       # (BT, 17, H)
 emb    = Projector(tokens)              # → (B, T, 17, D)
 ```
 
-同时缓存（S2/S3 用，S1 训练不用）：
+同时缓存（S2 的 NibblePE 用，S1 训练不用）：
 
 - `slot_attn`：`(B, T, 16, P)`
 - `n_hi`, `n_lo`, `n_hi_content`：由注意力图量化得到的离散码（见 §3）
@@ -183,7 +182,7 @@ python train.py --config-name=lewm_rope_s1   # 或 wall / point_maze / granular
 
 1. 将每 query 的 `attn` \((BT,16,P)\) 看成空间图，双线性插值到 16×16。
 2. 对第 \(i\) 个 query，取其对应粗槽窗口内的质量分布，求质心 → 量化为 \(n_{\mathrm{lo}}\)。
-3. \(n_{\mathrm{hi}}\)：槽身份（query 下标 0..15）；另算全图质心落入的粗格 → \(n_{\mathrm{hi\_content}}\)（S3 可选监督）。
+3. \(n_{\mathrm{hi}}\)：槽身份（query 下标 0..15）；另算全图质心落入的粗格 → \(n_{\mathrm{hi\_content}}\)。后者只在已放弃的 S3 里当过标签，当前训练不用。
 
 要点：低 nibble **可随物体在槽内移动**，不是写死的格子中心。训练时需监控 \(n_{\mathrm{lo}}\) 的熵/覆盖，防止塌缩。
 
@@ -233,29 +232,26 @@ e_{\mathrm{cell}}(u,v) = E_{\mathrm{row}}[u] + E_{\mathrm{col}}[v]
 
 加到 block-causal mask 上（实现见 `ARPredictor.forward`）。
 
-### 4.4 每层注入与固定 `n_lo`（当前 S2 默认）
+### 4.4 当前 S2 默认
 
-当前 S2 消融默认：
+原来的共享几何 NibblePE，只关掉相对偏置：
 
-- `inject_every_layer: true`：Transformer 每层前再加一次 NibblePE。
-- `n_lo_mode: fixed_center`：低 nibble 锁在每个粗槽 4×4 细格的中心，不再用注意力质心。  
-  绝对 PE 只随槽身份变，用于检验「动态细码是否是噪声」。
+- `abs_mode: shared`：粗、细共用 `E_row + E_col`，再经 `MLP_coarse` / `MLP_fine`。
+- `n_lo_mode: attn`：细码由注意力质心给出。
+- `inject_every_layer: true`
+- `use_relative_bias: false`：不加 `B_coarse` / `B_fine`。
 
-实现：
-
-- `JEPA.encode`：若 `n_lo_mode=fixed_center`，覆盖 `n_lo`。
-- `ARPredictor`：同模式下忽略传入的动态 `n_lo`，改用格子中心。
-
-恢复动态细码：`wm.n_lo_mode: attn`。关掉每层注入：`wm.inject_every_layer: false`。
+按槽独立嵌入（`abs_mode: slot`）只作消融，不是当前默认。
 
 ### 4.5 配置
 
 ```yaml
-# lewm_wall_s2.yaml（继承 s1）
 wm:
   pos_mode: nibble
   inject_every_layer: true
-  n_lo_mode: fixed_center
+  n_lo_mode: attn
+  use_relative_bias: false
+  abs_mode: shared
 ```
 
 训练：读出仍是 query+CLS；**损失仍无 nibble CE**。
@@ -270,53 +266,27 @@ wm:
 | 2 | 2D RoPE / 正弦 |
 | 3 | 16×16 因子化 `E_row[r]+E_col[c]`（\(r,c\in0..15\)） |
 | 4 | 平坦 `Embedding(256)`（hex 当普通 ID） |
-| 5 | **NibblePE**（共享 4×4 + 分级相对偏置） |
-| 6 | NibblePE，去掉参数共享 |
-| 7 | NibblePE，去掉相对偏置 |
+| 5 | NibblePE + 分级相对偏置（代码在，**不是当前默认**） |
+| 6 | NibblePE，去掉参数共享（`abs_mode: slot`，消融） |
+| 7 | **当前 S2**：NibblePE，去掉相对偏置 |
 
-期望：\(5 > 1,2,3,4\)；\(5 > 6\)（共享成立）。否则不要把 Nibble/hex 写进论文标题。
+rope 上采用的是第 7 行，不是第 5 行。带相对偏置的版本没有更好；按槽独立嵌入更差。不要再把「分级相对偏置」写成当前 S2。
 
 ---
 
-## 5. S3：辅助双 nibble 分类
+## 5. S3：已从代码移除（负结果）
 
-### 5.1 动机
+当前仓库没有 S3。训练损失只有 dense MSE + SIGReg，没有 `nibble_hi_head` / `nibble_lo_head`，也没有 `lewm_*_s3.yaml`。
 
-离散码相对正弦 / RoPE 的**硬优势**是：可做分类辅助任务，强迫表示携带可预测的空间动态。  
-主预测仍是连续语义；空间码是旁路监督。
+rope、同一 10 条 episode 上，双 nibble CE 两次都差于 §4.4 的 S2：
 
-### 5.2 损失
+| | 成功率 | 平均 Chamfer |
+|---|---|---|
+| S2 | 20% | 1.75 |
+| S3，权重 0.05 | 10% | 2.02 |
+| S3，权重 0.005 | 10% | 2.37 |
 
-主损失不变：
-
-\[
-\mathcal{L}_{\mathrm{main}} = \mathrm{MSE}(\hat z, z) + \lambda_{\mathrm{sig}}\mathrm{SIGReg}
-\]
-
-附加（仅对 16 个槽，不含全局）：
-
-\[
-\mathcal{L}_{\mathrm{sp}} = \mathrm{CE}(\hat n_{\mathrm{hi}}, n_{\mathrm{hi}}^{\ast})
-  + \mathrm{CE}(\hat n_{\mathrm{lo}}, n_{\mathrm{lo}})
-\]
-
-- 实现：`JEPA.nibble_hi_head` / `nibble_lo_head`；`train.py` 中 `loss.nibble.weight`。
-- \(n_{\mathrm{hi}}^{\ast}\) 可用槽身份或 `n_hi_content`（内容质心粗格）。
-- \(\lambda\) 从小开始（配置默认 `0.05`）。
-- **256 类联合 CE** 只做消融，不作主结果。
-
-### 5.3 配置
-
-```yaml
-# lewm_wall_s3.yaml（继承 s2）
-loss:
-  nibble:
-    weight: 0.05
-```
-
-### 5.4 过关标准
-
-相对 S2：再涨一点或持平不掉。掉了 → 主方法停在 S2，S3 写负结果即可。
+标签是注意力质心再量化，和规划用的 `M_task` 不是同一件事。权重大时分类头把嵌入拉去服务离散码；权重小时头学不会，噪声仍反传进预测器。主方法停在 S2，不要把相对偏置或分类损失加回来。
 
 ---
 
@@ -354,8 +324,8 @@ loss:
 
 1. **诊断与对齐**：评估 `M_task` 有效、训练硬 mask（C2）有害。  
 2. **S1 读出**：全局 + 可学习槽。  
-3. **S2 NibblePE**：radix-16 两级码与共享 4×4 几何 + 分级相对偏置（hex 是码的紧凑表示）。  
-4. **S3（可选）**：空间码可预测性。
+3. **S2 NibblePE**：radix-16 两级码、共享 4×4 几何、动态 `n_lo`、每层注入；相对偏置关闭（hex 是码的紧凑表示）。  
+4. **S3**：rope 上双 nibble CE 为负结果，已从代码移除。
 
 ---
 
@@ -366,24 +336,25 @@ loss:
 | Query 读出 / nibble 量化 / M_task | `jepa.py`（`SpatialQueryPool`, `nibble_codes_from_attn`, `compute_m_task_mask`） |
 | NibblePE / 预测器 | `module.py`（`NibblePE`, `ARPredictor`） |
 | 工厂 | `utils.py`（`build_lewm`） |
-| 损失（含 nibble CE） | `train.py`（`lejepa_forward`） |
+| 损失 | `train.py`（`lejepa_forward`：dense MSE + SIGReg） |
 | C1 配置 | `config/train/lewm_*_c1.yaml` |
 | S1 配置 | `config/train/lewm_*_s1.yaml` |
-| S2 / S3（wall 模板） | `config/train/lewm_wall_s2.yaml`, `lewm_wall_s3.yaml` |
+| S2 | `config/train/lewm_{wall,rope,granular,point_maze}_s2.yaml` |
 | 数据 | `config/train/data/{wall,point_maze,rope,granular}.yaml`；`STABLEWM_HOME/.../datasets/*_train.h5` |
 
 关键开关：
 
-| 键 | C1 | S1 | S2 | S3 |
-|----|----|----|----|-----|
-| `wm.pool_mode` | `avg` | `query` | `query` | `query` |
-| `wm.include_global_token` | false | true | true | true |
-| `wm.pos_mode` | learned | learned | **nibble** | nibble |
-| `wm.inject_every_layer` | false | false | **true** | true |
-| `wm.n_lo_mode` | — | — | **fixed_center** | fixed_center / attn |
-| `loss.nibble.weight` | — | — | — | **>0** |
-| `loss.m_dyn` | 无 | 无 | 无 | 无 |
-| `plan.cost_mode` | `m_task_terminal` | 同左 | 同左 | 同左 |
+| 键 | C1 | S1 | S2 |
+|----|----|----|-----|
+| `wm.pool_mode` | `avg` | `query` | `query` |
+| `wm.include_global_token` | false | true | true |
+| `wm.pos_mode` | learned | learned | **nibble** |
+| `wm.inject_every_layer` | false | false | **true** |
+| `wm.n_lo_mode` | — | — | **attn** |
+| `wm.use_relative_bias` | — | — | **false** |
+| `wm.abs_mode` | — | — | **shared** |
+| `loss.m_dyn` | 无 | 无 | 无 |
+| `plan.cost_mode` | `m_task_terminal` | 同左 | 同左 |
 
 ---
 
@@ -395,7 +366,7 @@ loss:
 4. 在 S1 同时换读出 + 每层 PE + 辅助 CE。  
 5. 为「训练评估一致」把世界模型改成只预测 mask 内格子（rollout 会崩）。  
 6. 继续加大 C2 的 `m_dyn.weight` 当主攻。  
-7. 污染已有 `*_c1.yaml`；新实验用 `*_s1/s2/s3`。
+7. 污染已有 `*_c1.yaml`；新实验用 `*_s1/s2`。不要把已删除的 nibble CE 加回来。
 
 ---
 
@@ -404,15 +375,15 @@ loss:
 - [ ] 固定 C1 数字（各环境 + `M_task`）与 CLS 数字  
 - [ ] 训 S1（建议先 rope / wall），对照 C1 与 CLS  
 - [ ] S1 过关后再训 S2；做 PE 消融表 §4.6  
-- [ ] S2 正向后小权重开 S3；联合 256-CE 仅消融  
-- [ ] 多环境复现；写清负结果（C2、失败消融）
+- [x] S3（双 nibble CE）在 rope 上为负结果，代码已退回 S2  
+- [ ] 多环境复现；写清负结果（C2、相对偏置、S3）
 
 ---
 
 ## 10. 一句话总结
 
 - **S1**：用 **CLS + 16 个可学习 query** 替换钝的平均池化，解决「空间 token 输给 CLS」的第一瓶颈。  
-- **S2**：用 **与 16 槽对齐的两级 nibble 位置编码（NibblePE）** 把细网格几何送进预测器；「十六进制」只是该码的紧凑写法。  
-- **S3**：用 **双 nibble CE** 让空间码可预测，强化几何动力学，但不替换 dense 世界模型损失。  
+- **S2（当前代码）**：用 **共享 4×4 的两级 NibblePE**，细码跟着注意力质心走，并且每层注入；相对偏置关闭。「十六进制」只是该码的紧凑写法。  
+- **S3**：双 nibble CE 在 rope 上不如 S2，已从代码移除。  
 
 三者叠加的主线是：**少 token 的空间 JEPA + 任务稀疏规划 + tokenization-aligned 离散空间码**，而不是单独卖一种 PE 名字。

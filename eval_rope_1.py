@@ -386,7 +386,6 @@ def load_lewm_model(
     pos_mode: str = "learned",
     inject_every_layer: bool = False,
     n_lo_mode: str = "attn",
-    aux_nibble: bool = False,
 ):
     # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -444,7 +443,6 @@ def load_lewm_model(
             pos_mode=pos_mode,
             inject_every_layer=inject_every_layer,
             n_lo_mode=n_lo_mode,
-            aux_nibble=aux_nibble,
         )
         model = load_lewm_weights_into_model(model, ckpt_path)
 
@@ -703,7 +701,6 @@ def parse_args():
         choices=["attn", "fixed_center"],
         help="attn=注意力质心细码；fixed_center=锁格子中心",
     )
-    p.add_argument("--aux-nibble", action="store_true")
     p.add_argument(
         "--cost-mode",
         default="dense_terminal",
@@ -832,7 +829,6 @@ def main():
         pos_mode=args.pos_mode,
         inject_every_layer=args.inject_every_layer,
         n_lo_mode=args.n_lo_mode,
-        aux_nibble=args.aux_nibble,
         cost_mode=args.cost_mode,
         m_task_threshold=args.m_task_threshold,
         m_task_mode=args.m_task_mode,

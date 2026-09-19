@@ -224,7 +224,6 @@ class JEPA(nn.Module):
         n_lo_mode: str = "attn",
         encoder_hidden_dim: int | None = None,
         embed_dim: int = 192,
-        aux_nibble: bool = False,
     ):
         super().__init__()
 
@@ -246,7 +245,6 @@ class JEPA(nn.Module):
         self.pos_mode = str(pos_mode)
         # attn: centroid-quantized low nibble; fixed_center: lock to slot-cell center
         self.n_lo_mode = str(n_lo_mode)
-        self.aux_nibble = bool(aux_nibble)
         self.embed_dim = int(embed_dim)
 
         hidden = encoder_hidden_dim
@@ -259,13 +257,6 @@ class JEPA(nn.Module):
                 num_queries=self.num_spatial_tokens,
                 spatial_grid=self.spatial_grid,
             )
-        n_class = self.spatial_grid * self.spatial_grid
-        if self.aux_nibble:
-            self.nibble_hi_head = nn.Linear(self.embed_dim, n_class)
-            self.nibble_lo_head = nn.Linear(self.embed_dim, n_class)
-        else:
-            self.nibble_hi_head = None
-            self.nibble_lo_head = None
 
     @property
     def use_spatial_tokens(self) -> bool:
@@ -379,15 +370,6 @@ class JEPA(nn.Module):
             preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
             preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
         return preds
-
-    def nibble_logits(self, pred_emb: torch.Tensor):
-        """pred_emb: (B, T, N, D) -> hi/lo logits over spatial slots."""
-        if self.nibble_hi_head is None or self.nibble_lo_head is None:
-            return None, None
-        slots = pred_emb
-        if getattr(self, "include_global_token", False):
-            slots = pred_emb[:, :, 1:, :]
-        return self.nibble_hi_head(slots), self.nibble_lo_head(slots)
 
     ####################
     ## Inference only ##

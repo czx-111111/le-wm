@@ -59,26 +59,6 @@ def lejepa_forward(self, batch, stage, cfg):
     output["sigreg_loss"] = self.sigreg(sigreg_in)
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
-    nibble_cfg = cfg.loss.get("nibble", None) if cfg.get("loss") is not None else None
-    nibble_w = float(nibble_cfg.weight) if nibble_cfg is not None else 0.0
-    if nibble_w > 0 and n_lo is not None and pred_emb.ndim == 4:
-        logits_hi, logits_lo = self.model.nibble_logits(pred_emb)
-        if logits_hi is not None:
-            tgt_hi = output.get("n_hi_content", n_hi)[:, n_preds:]
-            tgt_lo = n_lo[:, n_preds:]
-            ce_hi = torch.nn.functional.cross_entropy(
-                logits_hi.reshape(-1, logits_hi.size(-1)),
-                tgt_hi.reshape(-1).long(),
-            )
-            ce_lo = torch.nn.functional.cross_entropy(
-                logits_lo.reshape(-1, logits_lo.size(-1)),
-                tgt_lo.reshape(-1).long(),
-            )
-            output["nibble_hi_loss"] = ce_hi
-            output["nibble_lo_loss"] = ce_lo
-            output["nibble_loss"] = ce_hi + ce_lo
-            output["loss"] = output["loss"] + nibble_w * output["nibble_loss"]
-
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, on_epoch=True, sync_dist=True)
     return output
@@ -121,7 +101,6 @@ def run(cfg):
 
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
     plan_cfg = cfg.get("plan") or {}
-    nibble_cfg = cfg.loss.get("nibble", None) if cfg.get("loss") is not None else None
     world_model = build_lewm(
         action_dim=effective_act_dim,
         history_size=cfg.wm.history_size,
@@ -143,7 +122,8 @@ def run(cfg):
         pos_mode=str(cfg.wm.get("pos_mode", "learned")),
         inject_every_layer=bool(cfg.wm.get("inject_every_layer", False)),
         n_lo_mode=str(cfg.wm.get("n_lo_mode", "attn")),
-        aux_nibble=bool(nibble_cfg is not None and float(nibble_cfg.get("weight", 0.0)) > 0),
+        use_relative_bias=bool(cfg.wm.get("use_relative_bias", True)),
+        abs_mode=str(cfg.wm.get("abs_mode", "shared")),
     )
     optimizers = {
         'model_opt': {

@@ -270,34 +270,68 @@ def block_causal_attn_mask(num_frames: int, num_spatial: int, device, dtype):
 
 
 class NibblePE(nn.Module):
-    """Tokenization-aligned two-scale (radix-16) position encoding.
+    """Two-scale position encoding for the 16-slot bottleneck.
 
-    High nibble = 4x4 slot id, low nibble = 4x4 offset inside the slot.
-    Both scales share the same 4x4 row/col embeddings.
+    abs_mode:
+      - shared: coarse/fine share a 4x4 row/col table (legacy).
+      - slot: coarse is Embedding(16) per slot; fine is a separate Embedding(16)
+        and is only created when use_fine=True (dynamic n_lo).
     """
 
-    def __init__(self, dim: int, spatial_grid: int = 4, include_global: bool = True):
+    def __init__(
+        self,
+        dim: int,
+        spatial_grid: int = 4,
+        include_global: bool = True,
+        abs_mode: str = "shared",
+        use_fine: bool = True,
+        use_relative_bias: bool = True,
+    ):
         super().__init__()
         self.dim = int(dim)
         self.spatial_grid = int(spatial_grid)
+        self.abs_mode = str(abs_mode)
+        self.use_fine = bool(use_fine)
+        self.use_relative_bias = bool(use_relative_bias)
         g = self.spatial_grid
-        self.row_embed = nn.Embedding(g, dim)
-        self.col_embed = nn.Embedding(g, dim)
-        self.mlp_coarse = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.mlp_fine = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        n = g * g
         self.include_global = bool(include_global)
         self.global_embed = (
             nn.Parameter(torch.zeros(1, 1, 1, dim)) if self.include_global else None
         )
+        if self.abs_mode == "slot":
+            self.slot_embed = nn.Embedding(n, dim)
+            self.fine_embed = nn.Embedding(n, dim) if self.use_fine else None
+            self.row_embed = None
+            self.col_embed = None
+            self.mlp_coarse = None
+            self.mlp_fine = None
+        else:
+            self.slot_embed = None
+            self.fine_embed = None
+            self.row_embed = nn.Embedding(g, dim)
+            self.col_embed = nn.Embedding(g, dim)
+            self.mlp_coarse = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+            self.mlp_fine = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
         rel = 2 * (g - 1) + 1
         self.rel_span = g - 1
-        self.b_coarse = nn.Parameter(torch.zeros(rel, rel))
-        self.b_fine = nn.Parameter(torch.zeros(rel, rel))
+        if self.use_relative_bias:
+            self.b_coarse = nn.Parameter(torch.zeros(rel, rel))
+            self.b_fine = nn.Parameter(torch.zeros(rel, rel))
+        else:
+            self.b_coarse = None
+            self.b_fine = None
 
     def cell_embed(self, row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
         return self.row_embed(row) + self.col_embed(col)
 
     def absolute(self, n_hi: torch.Tensor, n_lo: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "abs_mode", "shared") == "slot":
+            pe = self.slot_embed(n_hi)
+            fine = getattr(self, "fine_embed", None)
+            if fine is not None:
+                pe = pe + fine(n_lo)
+            return pe
         g = self.spatial_grid
         row_h, col_h = n_hi // g, n_hi % g
         row_l, col_l = n_lo // g, n_lo % g
@@ -377,6 +411,8 @@ class ARPredictor(nn.Module):
         include_global_token: bool = False,
         inject_every_layer: bool = False,
         n_lo_mode: str = "attn",
+        use_relative_bias: bool = True,
+        abs_mode: str = "shared",
         spatial_grid: int = 4,
     ):
         super().__init__()
@@ -386,6 +422,8 @@ class ARPredictor(nn.Module):
         self.include_global_token = bool(include_global_token)
         self.inject_every_layer = bool(inject_every_layer)
         self.n_lo_mode = str(n_lo_mode)
+        self.use_relative_bias = bool(use_relative_bias)
+        self.abs_mode = str(abs_mode)
         self.spatial_grid = int(spatial_grid)
         self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
         use_learned_spatial = self.num_spatial_tokens > 1 and self.pos_mode != "nibble"
@@ -401,6 +439,9 @@ class ARPredictor(nn.Module):
                 dim=input_dim,
                 spatial_grid=self.spatial_grid,
                 include_global=self.include_global_token,
+                abs_mode=self.abs_mode,
+                use_fine=self.n_lo_mode == "attn",
+                use_relative_bias=self.use_relative_bias,
             )
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
@@ -454,11 +495,12 @@ class ARPredictor(nn.Module):
                     extra_pe = torch.cat([gpe, pe_slots], dim=2)
                 else:
                     extra_pe = pe_slots
-                rel = nibble_pe.relative_bias(n_hi, n_lo, num_tokens=N)
-                # (TN,TN) causal + (B,TN,TN) relative -> (B,1,TN,TN) for SDPA
-                attn_mask = attn_mask.to(dtype=x.dtype)
-                attn_mask = attn_mask.unsqueeze(0) + rel.to(dtype=x.dtype)
-                attn_mask = attn_mask.unsqueeze(1)
+                if bool(getattr(self, "use_relative_bias", True)):
+                    rel = nibble_pe.relative_bias(n_hi, n_lo, num_tokens=N)
+                    # (TN,TN) causal + (B,TN,TN) relative -> (B,1,TN,TN) for SDPA
+                    attn_mask = attn_mask.to(dtype=x.dtype)
+                    attn_mask = attn_mask.unsqueeze(0) + rel.to(dtype=x.dtype)
+                    attn_mask = attn_mask.unsqueeze(1)
             elif self.spatial_pos_embedding is not None:
                 x = x + self.spatial_pos_embedding[:, :, :N, :]
 

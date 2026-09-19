@@ -455,7 +455,6 @@ def parse_args():
         choices=["attn", "fixed_center"],
         help="attn=注意力质心细码；fixed_center=锁格子中心",
     )
-    p.add_argument("--aux-nibble", action="store_true")
     p.add_argument(
         "--cost-mode",
         default="dense_terminal",
@@ -601,7 +600,6 @@ def main():
         pos_mode=args.pos_mode,
         inject_every_layer=args.inject_every_layer,
         n_lo_mode=args.n_lo_mode,
-        aux_nibble=args.aux_nibble,
         cost_mode=args.cost_mode,
         m_task_threshold=args.m_task_threshold,
         m_task_mode=args.m_task_mode,
