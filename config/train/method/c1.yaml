@@ -1,0 +1,18 @@
+# @package _global_
+# C1：16 空间 token（avg pool），无全局 token；规划用 M_task
+wm:
+  type: lewm
+  token_mode: spatial16
+  num_spatial_tokens: 16
+  spatial_grid: 4
+  pool_mode: avg
+  include_global_token: false
+  pos_mode: learned
+  inject_every_layer: false
+
+plan:
+  cost_mode: m_task_terminal
+  m_task_mode: eps
+  m_task_threshold: 0.08
+  m_task_topk: 4
+  m_task_assume_normalized: true

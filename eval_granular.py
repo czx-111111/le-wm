@@ -39,8 +39,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 
-_DEFAULT_PLAN_GPU = "3"
-_DEFAULT_EGL_GPU = "4"
+_DEFAULT_PLAN_GPU = "0"
+_DEFAULT_EGL_GPU = "1"
 
 
 def _early_apply_gpu_argv():
@@ -59,7 +59,7 @@ def _early_apply_gpu_argv():
             plan_gpu = a.split("=", 1)[1]
 
     if plan_gpu == egl_gpu:
-        alts = [g for g in ("3", "4", "5", "6", "7") if g != egl_gpu]
+        alts = [g for g in ("0", "1") if g != egl_gpu]
         plan_gpu = alts[0] if alts else ("0" if egl_gpu != "0" else "1")
         print(
             f"[WARN] PLAN_GPU 与 EGL_GPU 相同，已自动将 PLAN_GPU 改为 {plan_gpu}",
@@ -73,7 +73,15 @@ def _early_apply_gpu_argv():
 
 _early_apply_gpu_argv()
 
-from eval_mpc_utils import to_hwc_uint8_compatible  # noqa: E402
+from eval_mpc_utils import (  # noqa: E402
+    EVAL_SPLITS,
+    PLAN_PROTOCOLS,
+    add_cost_cli_args,
+    apply_cost_attrs,
+    plan_context_len,
+    resolve_stats_path,
+    to_hwc_uint8_compatible,
+)
 from eval_rope_1 import (  # noqa: E402
     build_goal_lookup,
     build_info_dict,
@@ -231,7 +239,11 @@ def write_results(metrics: dict, results_path: Path):
     with results_path.open("w", encoding="utf-8") as f:
         f.write("==== GRANULAR SIMULATION EVALUATION ====\n")
         for k, v in metrics.items():
+            if k == "details":
+                continue
             f.write(f"{k}: {v}\n")
+    with results_path.with_name(results_path.stem + "_metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
 
 
 def _fit_proprio(prop: np.ndarray, ref_dim: int) -> np.ndarray:
@@ -263,14 +275,17 @@ def run_mpc_episodes(
     success_threshold: float,
     seed: int,
     cem_kwargs: dict,
+    plan_ctx: int,
+    split: str = "dev",
 ) -> dict:
     """MPC：CEM → 执行 n_taken → 用仿真观测重规划。"""
     import torch
 
     lookup = build_goal_lookup(h5_path)
     eval_episodes, eval_start_idx = sample_eval_points(
-        h5_path, num_eval, goal_offset_steps, history_size, seed
+        h5_path, num_eval, goal_offset_steps, history_size, seed, split=split
     )
+    num_eval = len(eval_episodes)
 
     successes = []
     cds = []
@@ -282,6 +297,7 @@ def run_mpc_episodes(
             f"\n[mpc {i + 1}/{num_eval}] episode={ep_id} start={start_step}",
             flush=True,
         )
+        torch.manual_seed(int(seed) + i)
         goal_step = int(start_step + goal_offset_steps)
         start_idx = lookup[(int(ep_id), int(start_step))]
         goal_idx = lookup[(int(ep_id), goal_step)]
@@ -292,7 +308,7 @@ def run_mpc_episodes(
             print("  [WARN] 缺少 state，跳过")
             continue
 
-        clip0 = load_sequence(h5_path, lookup, ep_id, start_step, history_size)
+        clip0 = load_sequence(h5_path, lookup, ep_id, start_step, plan_ctx)
         pixels_np = clip0["pixels"].numpy() if hasattr(clip0["pixels"], "numpy") else np.asarray(clip0["pixels"])
         proprio_np = (
             clip0["proprio"].numpy()
@@ -305,10 +321,10 @@ def run_mpc_episodes(
             else np.asarray(clip0["action"])
         )
 
-        hist_pixels = [to_hwc_uint8_compatible(pixels_np[t]) for t in range(history_size)]
-        hist_proprio = [np.asarray(proprio_np[t], dtype=np.float32).reshape(-1) for t in range(history_size)]
+        hist_pixels = [to_hwc_uint8_compatible(pixels_np[t]) for t in range(plan_ctx)]
+        hist_proprio = [np.asarray(proprio_np[t], dtype=np.float32).reshape(-1) for t in range(plan_ctx)]
         prop_dim = int(hist_proprio[0].size)
-        hist_act = [np.asarray(act_np[t], dtype=np.float32).reshape(-1) for t in range(history_size)]
+        hist_act = [np.asarray(act_np[t], dtype=np.float32).reshape(-1) for t in range(plan_ctx)]
 
         goal_particles = to_particle_state(goal_state)
         prep = client.prepare(seed=int(seed + i), init_state=init_state)
@@ -378,9 +394,9 @@ def run_mpc_episodes(
 
             for t in range(n_take):
                 hist_act.append(np.asarray(take_actions[t], dtype=np.float32).reshape(-1))
-            hist_act = hist_act[-history_size:]
-            hist_pixels = (hist_pixels + new_pixels)[-history_size:]
-            hist_proprio = (hist_proprio + new_proprio)[-history_size:]
+            hist_act = hist_act[-plan_ctx:]
+            hist_pixels = (hist_pixels + new_pixels)[-plan_ctx:]
+            hist_proprio = (hist_proprio + new_proprio)[-plan_ctx:]
 
             cd = chamfer_distance_np(goal_particles, final_state)
             success = cd < success_threshold
@@ -417,7 +433,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="LeWM Granular 仿真评估")
     p.add_argument("--dataset", default="./data/granular_eval.h5")
     p.add_argument("--ckpt", default="./data/lewm_granular_v1_weights.ckpt")
-    p.add_argument("--num-eval", type=int, default=50)
+    p.add_argument("--num-eval", type=int, default=0, help="0 = every episode of --split exactly once")
     p.add_argument(
         "--goal-offset",
         type=int,
@@ -448,27 +464,36 @@ def parse_args():
     p.add_argument("--pool-mode", default="avg", choices=["avg", "query"])
     p.add_argument("--include-global-token", action="store_true")
     p.add_argument("--pos-mode", default="learned", choices=["learned", "nibble"])
-    p.add_argument("--inject-every-layer", action="store_true")
+    p.add_argument(
+        "--inject-every-layer",
+        action="store_true",
+        default=None,
+        help="omit to keep the value stored in an *_object.ckpt",
+    )
     p.add_argument(
         "--n-lo-mode",
-        default="attn",
+        default=None,
         choices=["attn", "fixed_center"],
         help="attn=注意力质心细码；fixed_center=锁格子中心",
     )
-    p.add_argument(
-        "--cost-mode",
-        default="dense_terminal",
-        choices=["dense_terminal", "m_task_terminal"],
-    )
-    p.add_argument("--m-task-threshold", type=float, default=0.08)
-    p.add_argument("--m-task-mode", default="eps", choices=["eps", "topk", "mean"])
-    p.add_argument("--m-task-topk", type=int, default=4)
-    p.add_argument("--m-task-raw-pixels", action="store_true")
+    add_cost_cli_args(p)
 
     p.add_argument("--cem-num-samples", type=int, default=300)
     p.add_argument("--cem-n-steps", type=int, default=30)
     p.add_argument("--cem-topk", type=int, default=30)
     p.add_argument("--cem-var-scale", type=float, default=1.0)
+    p.add_argument("--plan-protocol", default="lewm", choices=PLAN_PROTOCOLS)
+    p.add_argument(
+        "--split",
+        default="dev",
+        choices=EVAL_SPLITS,
+        help="dev = odd eval episodes (tuning); test = even (final numbers only); all = both",
+    )
+    p.add_argument(
+        "--stats-dataset",
+        default=None,
+        help="h5 used to fit action/proprio normalizers; default: *_train.h5 next to --dataset",
+    )
     p.add_argument("--plan-device", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--plan-gpu", type=str, default=_DEFAULT_PLAN_GPU)
     p.add_argument("--egl-gpu", type=str, default=_DEFAULT_EGL_GPU)
@@ -476,8 +501,8 @@ def parse_args():
     p.add_argument(
         "--planner",
         choices=["mpc", "openloop"],
-        default="mpc",
-        help="mpc=滚动规划（默认）；openloop=旧开环 CEM",
+        default="openloop",
+        help="openloop=开环 CEM（r3 正式协议，默认）；mpc=滚动规划（仅消融）",
     )
     p.add_argument(
         "--n-taken-actions",
@@ -571,7 +596,9 @@ def main():
         f"mpc_max_iters={args.mpc_max_iters}"
     )
 
-    process = build_processors(str(dataset_path), ("action", "proprio"))
+    stats_path = resolve_stats_path(dataset_path, args.stats_dataset)
+    print(f"[INFO] normalizer stats: {stats_path}  plan_protocol={args.plan_protocol}")
+    process = build_processors(stats_path, ("action", "proprio"))
     transform = {
         "pixels": img_transform(args.img_size),
         "goal": img_transform(args.img_size),
@@ -606,9 +633,12 @@ def main():
         m_task_topk=args.m_task_topk,
         m_task_assume_normalized=not args.m_task_raw_pixels,
     )
+    apply_cost_attrs(model, args)
     if args.plan_device == "cuda" and not torch.cuda.is_available():
-        print("[WARN] CUDA 不可用，plan-device 改用 cpu")
-        args.plan_device = "cpu"
+        raise SystemExit(
+            f"CUDA unavailable (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}); "
+            "pass a valid --plan-gpu or --plan-device cpu explicitly"
+        )
     device = torch.device(args.plan_device)
     model = model.to(device)
     print(f"[INFO] plan device={device}", flush=True)
@@ -618,6 +648,7 @@ def main():
         n_steps=args.cem_n_steps,
         topk=args.cem_topk,
         var_scale=args.cem_var_scale,
+        protocol=args.plan_protocol,
     )
 
     t0 = time.time()
@@ -643,6 +674,8 @@ def main():
                 success_threshold=args.success_threshold,
                 seed=args.seed,
                 cem_kwargs=cem_kwargs,
+                plan_ctx=plan_context_len(args.plan_protocol, args.history_size),
+                split=args.split,
             )
         finally:
             client.close()
@@ -651,6 +684,9 @@ def main():
         metrics.update(
             {
                 "mode": "mpc_two_process",
+                "plan_protocol": args.plan_protocol,
+                "split": args.split,
+                "stats_dataset": stats_path,
                 "plan_device": args.plan_device,
                 "plan_gpu": os.environ.get("PLAN_GPU"),
                 "egl_gpu": os.environ.get("EGL_GPU"),
@@ -674,9 +710,12 @@ def main():
             cem_n_steps=args.cem_n_steps,
             cem_topk=args.cem_topk,
             cem_var_scale=args.cem_var_scale,
+            plan_protocol=args.plan_protocol,
+            split=args.split,
         )
         plan_time = time.time() - t0
-        plans_out = args.plans_out or str(ROOT / "outputs" / "granular_plans.pkl")
+        # Per-run default so concurrent evals never read each other's plans.
+        plans_out = args.plans_out or str(Path(args.output).with_suffix("")) + "_plans.pkl"
         Path(plans_out).parent.mkdir(parents=True, exist_ok=True)
         with open(plans_out, "wb") as f:
             pickle.dump(plans, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -694,6 +733,9 @@ def main():
         metrics.update(
             {
                 "mode": "openloop_two_process",
+                "plan_protocol": args.plan_protocol,
+                "split": args.split,
+                "stats_dataset": stats_path,
                 "planner": "openloop",
                 "plan_device": args.plan_device,
                 "plan_gpu": os.environ.get("PLAN_GPU"),

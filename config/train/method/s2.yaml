@@ -1,0 +1,24 @@
+# @package _global_
+# S2：在 S1 上换 NibblePE + 逐层注入（无相对偏置）
+defaults:
+  - s1
+  - _self_
+
+wm:
+  pos_mode: nibble
+  inject_every_layer: true
+  n_lo_mode: attn
+  use_relative_bias: false
+  abs_mode: shared
+  # Stage-3 C3 defaults = current S2 behavior
+  locality: none          # none | gauss | hard_halo
+  locality_sigma_init: 2.0
+  locality_sigma_min: 1.0
+  halo: 1
+  fine_mode: discrete     # discrete | continuous
+  softargmax_temp: 1.0
+  fine_fourier_freqs: 8
+  fine_conf_gate: true
+  pos_prop:
+    enabled: false
+    weight: 0.01

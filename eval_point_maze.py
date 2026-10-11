@@ -5,7 +5,7 @@ LeWM PointMaze 仿真评估（DINO-WM PointMaze）
 对齐训练配置：action_dim=2, frameskip=5 → 规划维数 10。
 成功判据：||goal[:2] - cur[:2]||_2 < 0.5（与 DINO-WM PointMazeWrapper.eval_state 一致）。
 评估条数：默认 50（对齐 plan_point_maze.yaml 的 n_evals=50）。
-默认规划卡：物理 GPU 7。
+默认规划卡：物理 GPU 0。
 
 默认 planner=mpc（滚动规划）；--planner openloop 可复现旧开环 CEM。
 
@@ -38,7 +38,7 @@ if str(ROOT) not in sys.path:
 def _early_apply_gpu_argv():
     """在 import torch 之前锁定物理 GPU。"""
     argv = sys.argv[1:]
-    plan_gpu = "7"
+    plan_gpu = os.environ.get("PLAN_GPU", "0")
     for i, a in enumerate(argv):
         if a == "--plan-gpu" and i + 1 < len(argv):
             plan_gpu = argv[i + 1]
@@ -78,7 +78,11 @@ def _setup_mujoco():
     bin_dir = str(mujoco_root / "bin")
     ld = os.environ.get("LD_LIBRARY_PATH", "")
     parts = [p for p in ld.split(os.pathsep) if p]
-    extras = [bin_dir, "/usr/lib/nvidia", "/usr/lib/x86_64-linux-gnu"]
+    # torch's pip CUDA libs must shadow the system ones (e.g. an older
+    # /usr/lib/x86_64-linux-gnu/libnvJitLink.so.12 breaks libcusparse).
+    nv_root = Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages" / "nvidia"
+    nv_libs = sorted(str(d) for d in nv_root.glob("*/lib") if d.is_dir())
+    extras = [bin_dir, *nv_libs, "/usr/lib/nvidia", "/usr/lib/x86_64-linux-gnu"]
     new_parts = []
     for p in extras + parts:
         if p and p not in new_parts:
@@ -224,8 +228,16 @@ from torchvision.transforms import v2 as transforms
 import stable_pretraining as spt
 from utils import build_lewm, load_lewm_weights_into_model
 from eval_mpc_utils import (
+    EVAL_SPLITS,
+    PLAN_PROTOCOLS,
+    filter_split_episodes,
     as_numpy,
+    add_cost_cli_args,
+    apply_cost_attrs,
+    cem_lewm,
     extract_macro_frames,
+    plan_context_len,
+    resolve_stats_path,
     stack_history_clip,
     to_hwc_uint8_compatible,
 )
@@ -264,6 +276,7 @@ def sample_eval_points(
     history_size: int,
     frameskip: int,
     seed: int = 42,
+    split: str = "dev",
 ):
     """采样 (episode, start_step)，保证 history(带 frameskip) 与 goal 都在轨迹内。"""
     with h5py.File(h5_path, "r") as f:
@@ -275,7 +288,7 @@ def sample_eval_points(
         history_size * frameskip - 1,
     )
     max_start = ep_len - need - 1
-    valid_ep = np.nonzero(max_start >= 0)[0]
+    valid_ep = filter_split_episodes(np.nonzero(max_start >= 0)[0], split)
     if len(valid_ep) == 0:
         raise RuntimeError(
             f"没有足够长的 episode：需要至少 {need + 1} 帧 "
@@ -283,6 +296,8 @@ def sample_eval_points(
         )
 
     g = np.random.default_rng(seed)
+    if num_eval <= 0:
+        num_eval = len(valid_ep)
     replace = len(valid_ep) < num_eval
     chosen_ep = g.choice(valid_ep, size=num_eval, replace=replace)
 
@@ -465,6 +480,7 @@ def cem_plan(
     topk: int = 30,
     var_scale: float = 1.0,
     device: str = "cuda",
+    protocol: str = "lewm",
 ):
     device = torch.device(device)
     info = {
@@ -473,6 +489,11 @@ def cem_plan(
     }
     if device.type == "cuda":
         torch.cuda.synchronize()
+
+    if protocol == "lewm":
+        return cem_lewm(
+            model, info, horizon, action_dim, num_samples, n_steps, topk, var_scale, device
+        )
 
     history = info["pixels"].shape[2]
     total_steps = history + horizon
@@ -532,8 +553,8 @@ def load_lewm_model(
     pool_mode: str = "avg",
     include_global_token: bool = False,
     pos_mode: str = "learned",
-    inject_every_layer: bool = False,
-    n_lo_mode: str = "attn",
+    inject_every_layer: bool | None = None,
+    n_lo_mode: str | None = None,
 ):
     # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -557,10 +578,13 @@ def load_lewm_model(
             model.include_global_token = False
         if not hasattr(model, "pos_mode"):
             model.pos_mode = "learned"
-        model.n_lo_mode = n_lo_mode
-        if hasattr(model, "predictor"):
-            model.predictor.n_lo_mode = n_lo_mode
-            model.predictor.inject_every_layer = inject_every_layer
+        # Architecture flags come from the pickled model unless explicitly overridden.
+        if n_lo_mode is not None:
+            model.n_lo_mode = n_lo_mode
+            if hasattr(model, "predictor"):
+                model.predictor.n_lo_mode = n_lo_mode
+        if inject_every_layer is not None and hasattr(model, "predictor"):
+            model.predictor.inject_every_layer = bool(inject_every_layer)
         if token_mode != "cls" and getattr(model, "token_mode", "cls") != token_mode:
             print(
                 f"[WARN] ckpt token_mode={model.token_mode} "
@@ -592,8 +616,8 @@ def load_lewm_model(
             pool_mode=pool_mode,
             include_global_token=include_global_token,
             pos_mode=pos_mode,
-            inject_every_layer=inject_every_layer,
-            n_lo_mode=n_lo_mode,
+            inject_every_layer=bool(inject_every_layer),
+            n_lo_mode=n_lo_mode or "attn",
         )
         model = load_lewm_weights_into_model(model, ckpt_path)
 
@@ -609,7 +633,8 @@ def load_lewm_model(
         f"pool_mode={getattr(model, 'pool_mode', 'avg')} "
         f"include_global={getattr(model, 'include_global_token', False)} "
         f"pos_mode={getattr(model, 'pos_mode', 'learned')} "
-        f"n_lo_mode={getattr(model, 'n_lo_mode', 'attn')}"
+        f"n_lo_mode={getattr(model, 'n_lo_mode', 'attn')} "
+        f"inject_every_layer={getattr(getattr(model, 'predictor', None), 'inject_every_layer', None)}"
     )
 
     model.eval()
@@ -766,6 +791,7 @@ def run_mpc_episode(
     cem_kwargs: dict,
     device: str,
     seed: int,
+    plan_ctx: int,
 ):
     """MPC: CEM plan → execute n_taken macros → replan from env feedback."""
     effective_act_dim = frameskip * action_dim
@@ -774,8 +800,8 @@ def run_mpc_episode(
 
     pixels_np = as_numpy(init_clip["pixels"])
     proprio_np = as_numpy(init_clip["proprio"])
-    hist_pixels = [to_hwc_uint8_compatible(pixels_np[i]) for i in range(history_size)]
-    hist_proprio = [np.asarray(proprio_np[i], dtype=np.float32).reshape(-1) for i in range(history_size)]
+    hist_pixels = [to_hwc_uint8_compatible(pixels_np[i]) for i in range(plan_ctx)]
+    hist_proprio = [np.asarray(proprio_np[i], dtype=np.float32).reshape(-1) for i in range(plan_ctx)]
     hist_act_raw = np.asarray(init_clip["action_raw"], dtype=np.float32).reshape(-1, action_dim)
 
     goal = np.asarray(goal_state, dtype=np.float32).reshape(-1)
@@ -784,6 +810,7 @@ def run_mpc_episode(
     n_mpc_iters = 0
     success = False
     state_dist = float(env.eval_state(goal, final_state)["state_dist"])
+    dist_history = [state_dist]
 
     for it in range(mpc_max_iters):
         cur_metrics = env.eval_state(goal, final_state)
@@ -794,10 +821,10 @@ def run_mpc_episode(
             break
 
         clip = stack_history_clip(
-            hist_pixels, hist_proprio, hist_act_raw, history_size, frameskip, action_dim
+            hist_pixels, hist_proprio, hist_act_raw, plan_ctx, frameskip, action_dim
         )
         clip["action"] = normalize_concat_actions(
-            clip["action_raw"], process, history_size, frameskip, action_dim
+            clip["action_raw"], process, plan_ctx, frameskip, action_dim
         )
         info = build_info_dict(clip, goal_pixels, goal_proprio, process, transform)
         planned_norm, plan_cost = cem_plan(
@@ -827,14 +854,15 @@ def run_mpc_episode(
 
         new_pixels, new_proprio = extract_macro_frames(obses, n_take, frameskip)
         hist_act_raw = np.concatenate([hist_act_raw, env_actions], axis=0)
-        need = history_size * frameskip
+        need = plan_ctx * frameskip
         hist_act_raw = hist_act_raw[-need:]
-        hist_pixels = (hist_pixels + new_pixels)[-history_size:]
-        hist_proprio = (hist_proprio + new_proprio)[-history_size:]
+        hist_pixels = (hist_pixels + new_pixels)[-plan_ctx:]
+        hist_proprio = (hist_proprio + new_proprio)[-plan_ctx:]
 
         final_state = as_numpy(infos["state"][-1]).astype(np.float32).reshape(-1)
         m = env.eval_state(goal, final_state)
         state_dist = float(m["state_dist"])
+        dist_history.append(state_dist)
         success = bool(m["success"])
         if success:
             print(f"  [MPC] success after iter={it + 1}", flush=True)
@@ -846,6 +874,7 @@ def run_mpc_episode(
         "final_state": final_state,
         "plan_cost": float(np.mean(plan_costs)) if plan_costs else -1.0,
         "mpc_iters": n_mpc_iters,
+        "dist_history": dist_history,
     }
 
 
@@ -877,8 +906,10 @@ def evaluate(args):
 
     device = args.plan_device
     if device == "cuda" and not torch.cuda.is_available():
-        print("[WARN] CUDA 不可用，改用 CPU")
-        device = "cpu"
+        raise SystemExit(
+            f"CUDA unavailable (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}); "
+            "pass a valid --plan-gpu or --plan-device cpu explicitly"
+        )
 
     print(f"[INFO] 加载模型: {args.ckpt}")
     model = load_lewm_model(
@@ -909,9 +940,13 @@ def evaluate(args):
         m_task_topk=args.m_task_topk,
         m_task_assume_normalized=not args.m_task_raw_pixels,
     )
+    apply_cost_attrs(model, args)
     model = model.to(device)
 
-    process = build_processors(args.dataset)
+    stats_path = resolve_stats_path(args.dataset, args.stats_dataset)
+    print(f"[INFO] normalizer stats: {stats_path}  plan_protocol={args.plan_protocol}")
+    process = build_processors(stats_path)
+    ctx = plan_context_len(args.plan_protocol, args.history_size)
     transform = {"pixels": img_transform(args.img_size), "goal": img_transform(args.img_size)}
     lookup = build_goal_lookup(args.dataset)
     eval_episodes, eval_starts = sample_eval_points(
@@ -921,7 +956,9 @@ def evaluate(args):
         args.history_size,
         args.frameskip,
         args.seed,
+        split=args.split,
     )
+    args.num_eval = len(eval_episodes)
 
     print("[INFO] 初始化 PointMazeEnv...")
     env = make_point_maze_env()
@@ -932,6 +969,7 @@ def evaluate(args):
 
     for i, (ep_id, start_step) in enumerate(zip(eval_episodes, eval_starts)):
         print(f"\n[{i + 1}/{args.num_eval}] episode={ep_id} start={start_step}", flush=True)
+        torch.manual_seed(int(args.seed) + i)
         goal_step = int(start_step + args.goal_offset)
         start_idx = lookup[(int(ep_id), int(start_step))]
         goal_idx = lookup[(int(ep_id), goal_step)]
@@ -947,14 +985,14 @@ def evaluate(args):
             lookup,
             ep_id,
             start_step,
-            args.history_size,
+            ctx,
             args.frameskip,
             args.action_dim,
         )
         clip["action"] = normalize_concat_actions(
             clip["action_raw"],
             process,
-            args.history_size,
+            ctx,
             args.frameskip,
             args.action_dim,
         )
@@ -964,6 +1002,7 @@ def evaluate(args):
             n_steps=args.cem_n_steps,
             topk=args.cem_topk,
             var_scale=args.cem_var_scale,
+            protocol=args.plan_protocol,
         )
 
         if args.planner == "mpc":
@@ -978,6 +1017,7 @@ def evaluate(args):
                 process=process,
                 transform=transform,
                 history_size=args.history_size,
+                plan_ctx=ctx,
                 frameskip=args.frameskip,
                 action_dim=args.action_dim,
                 horizon=args.horizon,
@@ -1037,6 +1077,7 @@ def evaluate(args):
         }
         if args.planner == "mpc":
             detail["mpc_iters"] = sim.get("mpc_iters", -1)
+            detail["dist_history"] = sim.get("dist_history")
         details.append(detail)
         print(
             f"  state_dist={sim['state_dist']:.4f} success={sim['success']}",
@@ -1058,6 +1099,9 @@ def evaluate(args):
         "horizon": args.horizon,
         "goal_offset": args.goal_offset,
         "history_size": args.history_size,
+        "plan_protocol": args.plan_protocol,
+        "split": args.split,
+        "stats_dataset": stats_path,
         "planner": args.planner,
         "n_taken_actions": args.n_taken_actions if args.planner == "mpc" else None,
         "mpc_max_iters": args.mpc_max_iters if args.planner == "mpc" else None,
@@ -1069,7 +1113,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="LeWM PointMaze 仿真评估")
     p.add_argument("--dataset", default="./data/point_maze_eval.h5")
     p.add_argument("--ckpt", default="./data/lewm_point_maze_v2_weights.ckpt")
-    p.add_argument("--num-eval", type=int, default=50)
+    p.add_argument("--num-eval", type=int, default=0, help="0 = every episode of --split exactly once")
     p.add_argument(
         "--goal-offset",
         type=int,
@@ -1105,33 +1149,43 @@ def parse_args():
     p.add_argument("--pool-mode", default="avg", choices=["avg", "query"])
     p.add_argument("--include-global-token", action="store_true")
     p.add_argument("--pos-mode", default="learned", choices=["learned", "nibble"])
-    p.add_argument("--inject-every-layer", action="store_true")
+    p.add_argument(
+        "--inject-every-layer",
+        action="store_true",
+        default=None,
+        help="omit to keep the value stored in an *_object.ckpt",
+    )
     p.add_argument(
         "--n-lo-mode",
-        default="attn",
+        default=None,
         choices=["attn", "fixed_center"],
         help="attn=注意力质心细码；fixed_center=锁格子中心",
     )
-    p.add_argument(
-        "--cost-mode",
-        default="dense_terminal",
-        choices=["dense_terminal", "m_task_terminal"],
-        help="规划 cost；C1 用 m_task_terminal；同 ckpt 可切 dense 做消融",
-    )
-    p.add_argument("--m-task-threshold", type=float, default=0.08)
-    p.add_argument("--m-task-mode", default="eps", choices=["eps", "topk", "mean"])
-    p.add_argument("--m-task-topk", type=int, default=4)
-    p.add_argument(
-        "--m-task-raw-pixels",
-        action="store_true",
-        help="若 info 像素未 ImageNet normalize，打开此开关",
-    )
+    add_cost_cli_args(p)
 
     # 对齐 plan_point_maze.yaml: samples=300, opt_steps=10, topk=30
     p.add_argument("--cem-num-samples", type=int, default=300)
     p.add_argument("--cem-n-steps", type=int, default=10)
     p.add_argument("--cem-topk", type=int, default=30)
     p.add_argument("--cem-var-scale", type=float, default=1.0)
+    p.add_argument(
+        "--split",
+        default="dev",
+        choices=EVAL_SPLITS,
+        help="dev = odd eval episodes (tuning); test = even (final numbers only); all = both",
+    )
+    p.add_argument(
+        "--plan-protocol",
+        default="lewm",
+        choices=PLAN_PROTOCOLS,
+        help="lewm: 1-frame context, CEM over horizon only, return elite mean (official LeWM/swm); "
+        "legacy: r1 behaviour (history_size dataset frames, pinned history actions, best sample)",
+    )
+    p.add_argument(
+        "--stats-dataset",
+        default=None,
+        help="h5 used to fit action/proprio normalizers; default: *_train.h5 next to --dataset",
+    )
     p.add_argument(
         "--planner",
         choices=["mpc", "openloop"],
@@ -1147,14 +1201,14 @@ def parse_args():
     p.add_argument(
         "--mpc-max-iters",
         type=int,
-        default=5,
-        help="MPC 最大重规划轮数；成功则提前停",
+        default=10,
+        help="MPC 最大重规划轮数；成功则提前停（r2：10，主表读 success@2）",
     )
     p.add_argument(
         "--plan-gpu",
         type=str,
-        default="7",
-        help="规划用物理 GPU 编号（默认 7；在 import torch 前写入 CUDA_VISIBLE_DEVICES）",
+        default="0",
+        help="规划用物理 GPU 编号（默认 0；在 import torch 前写入 CUDA_VISIBLE_DEVICES）",
     )
     p.add_argument("--plan-device", default="cuda", choices=["cuda", "cpu"])
     return p.parse_args()

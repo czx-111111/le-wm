@@ -67,7 +67,7 @@ def _setup_runtime_env():
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-    egl_gpu = str(os.environ.get("EGL_GPU", "5"))
+    egl_gpu = str(os.environ.get("EGL_GPU", "1"))
     # 默认规划卡 = EGL_GPU-1（绕开），避免与 Flex 同卡
     default_plan = str(max(0, int(egl_gpu) - 1))
     plan_gpu = str(os.environ.get("PLAN_GPU", default_plan))
@@ -107,6 +107,16 @@ from torchvision.transforms import v2 as transforms
 
 import stable_pretraining as spt
 from utils import load_lewm_weights_into_model
+from eval_mpc_utils import (
+    EVAL_SPLITS,
+    PLAN_PROTOCOLS,
+    add_cost_cli_args,
+    apply_cost_attrs,
+    cem_lewm,
+    filter_split_episodes,
+    plan_context_len,
+    resolve_stats_path,
+)
 
 
 def chamfer_distance(x, y):
@@ -162,16 +172,27 @@ def build_goal_lookup(h5_path: str):
     return lookup
 
 
-def sample_eval_points(h5_path: str, num_eval: int, goal_offset_steps: int, history_size: int, seed: int = 42):
+def sample_eval_points(
+    h5_path: str,
+    num_eval: int,
+    goal_offset_steps: int,
+    history_size: int,
+    seed: int = 42,
+    split: str = "dev",
+):
     with h5py.File(h5_path, "r") as f:
         ep_len = f["ep_len"][:]
 
     max_start = ep_len - goal_offset_steps - 1
-    valid_ep = np.nonzero((max_start >= 0) & (ep_len >= history_size))[0]
+    valid_ep = filter_split_episodes(
+        np.nonzero((max_start >= 0) & (ep_len >= history_size))[0], split
+    )
     if len(valid_ep) == 0:
         raise RuntimeError("没有足够长的 episode 可用于评估")
 
     g = np.random.default_rng(seed)
+    if num_eval <= 0:
+        num_eval = len(valid_ep)
     replace = len(valid_ep) < num_eval
     chosen_ep = g.choice(valid_ep, size=num_eval, replace=replace)
 
@@ -312,6 +333,7 @@ def cem_plan(
     topk: int = 30,
     var_scale: float = 1.0,
     device: str = "cuda",
+    protocol: str = "lewm",
 ):
     device = torch.device(device)
     # 将 info 搬到规划设备（build_info 已留在 CPU）
@@ -323,6 +345,11 @@ def cem_plan(
     if device.type == "cuda":
         torch.cuda.synchronize()
     print("    [dbg] info on device OK", flush=True)
+
+    if protocol == "lewm":
+        return cem_lewm(
+            model, info, horizon, action_dim, num_samples, n_steps, topk, var_scale, device
+        )
 
     history = info["pixels"].shape[2]
     total_steps = history + horizon
@@ -384,8 +411,8 @@ def load_lewm_model(
     pool_mode: str = "avg",
     include_global_token: bool = False,
     pos_mode: str = "learned",
-    inject_every_layer: bool = False,
-    n_lo_mode: str = "attn",
+    inject_every_layer: bool | None = None,
+    n_lo_mode: str | None = None,
 ):
     # *_object.ckpt 是整模 JEPA；weights 才是 Lightning state_dict
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -409,10 +436,13 @@ def load_lewm_model(
             model.include_global_token = False
         if not hasattr(model, "pos_mode"):
             model.pos_mode = "learned"
-        model.n_lo_mode = n_lo_mode
-        if hasattr(model, "predictor"):
-            model.predictor.n_lo_mode = n_lo_mode
-            model.predictor.inject_every_layer = inject_every_layer
+        # Architecture flags come from the pickled model unless explicitly overridden.
+        if n_lo_mode is not None:
+            model.n_lo_mode = n_lo_mode
+            if hasattr(model, "predictor"):
+                model.predictor.n_lo_mode = n_lo_mode
+        if inject_every_layer is not None and hasattr(model, "predictor"):
+            model.predictor.inject_every_layer = bool(inject_every_layer)
     else:
         from utils import build_lewm
 
@@ -441,8 +471,8 @@ def load_lewm_model(
             pool_mode=pool_mode,
             include_global_token=include_global_token,
             pos_mode=pos_mode,
-            inject_every_layer=inject_every_layer,
-            n_lo_mode=n_lo_mode,
+            inject_every_layer=bool(inject_every_layer),
+            n_lo_mode=n_lo_mode or "attn",
         )
         model = load_lewm_weights_into_model(model, ckpt_path)
 
@@ -454,7 +484,8 @@ def load_lewm_model(
         f"pool_mode={getattr(model, 'pool_mode', 'avg')} "
         f"include_global={getattr(model, 'include_global_token', False)} "
         f"pos_mode={getattr(model, 'pos_mode', 'learned')} "
-        f"n_lo_mode={getattr(model, 'n_lo_mode', 'attn')}"
+        f"n_lo_mode={getattr(model, 'n_lo_mode', 'attn')} "
+        f"inject_every_layer={getattr(getattr(model, 'predictor', None), 'inject_every_layer', None)}"
     )
 
     model.eval()
@@ -489,16 +520,20 @@ def plan_episodes(
     cem_n_steps: int = 30,
     cem_topk: int = 30,
     cem_var_scale: float = 1.0,
+    plan_protocol: str = "lewm",
+    split: str = "dev",
 ):
     """Phase-1: 只做 CEM 规划，不碰 PyFleX。"""
     lookup = build_goal_lookup(h5_path)
     eval_episodes, eval_start_idx = sample_eval_points(
-        h5_path, num_eval, goal_offset_steps, history_size, seed
+        h5_path, num_eval, goal_offset_steps, history_size, seed, split=split
     )
+    num_eval = len(eval_episodes)
 
     plans = []
     for i, (ep_id, start_step) in enumerate(zip(eval_episodes, eval_start_idx)):
         print(f"\n[plan {i + 1}/{num_eval}] episode={ep_id} start={start_step}", flush=True)
+        torch.manual_seed(int(seed) + i)
         goal_step = int(start_step + goal_offset_steps)
         start_idx = lookup[(int(ep_id), int(start_step))]
         goal_idx = lookup[(int(ep_id), goal_step)]
@@ -509,7 +544,9 @@ def plan_episodes(
             print("  [WARN] 缺少 state，跳过")
             continue
 
-        clip = load_sequence(h5_path, lookup, ep_id, start_step, history_size)
+        clip = load_sequence(
+            h5_path, lookup, ep_id, start_step, plan_context_len(plan_protocol, history_size)
+        )
         info = build_info_dict(clip, goal_pixels, goal_proprio, process, transform)
         planned_norm, plan_cost = cem_plan(
             model,
@@ -521,6 +558,7 @@ def plan_episodes(
             topk=cem_topk,
             var_scale=cem_var_scale,
             device=device,
+            protocol=plan_protocol,
         )
         planned_actions = denormalize_actions(planned_norm.detach().cpu().numpy(), process)
         print(f"  plan_cost={plan_cost:.4f}", flush=True)
@@ -651,14 +689,18 @@ def write_results(metrics: dict, results_path: Path):
     with results_path.open("w", encoding="utf-8") as f:
         f.write("==== ROPE SIMULATION EVALUATION ====\n")
         for k, v in metrics.items():
+            if k == "details":
+                continue
             f.write(f"{k}: {v}\n")
+    with results_path.with_name(results_path.stem + "_metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="LeWM Rope 仿真评估")
     p.add_argument("--dataset", default="./data/rope_eval.h5")
     p.add_argument("--ckpt", default="./data/lewm_rope_weights.ckpt")
-    p.add_argument("--num-eval", type=int, default=50)
+    p.add_argument("--num-eval", type=int, default=0, help="0 = every episode of --split exactly once")
     p.add_argument(
         "--goal-offset",
         type=int,
@@ -694,27 +736,36 @@ def parse_args():
     p.add_argument("--pool-mode", default="avg", choices=["avg", "query"])
     p.add_argument("--include-global-token", action="store_true")
     p.add_argument("--pos-mode", default="learned", choices=["learned", "nibble"])
-    p.add_argument("--inject-every-layer", action="store_true")
+    p.add_argument(
+        "--inject-every-layer",
+        action="store_true",
+        default=None,
+        help="omit to keep the value stored in an *_object.ckpt",
+    )
     p.add_argument(
         "--n-lo-mode",
-        default="attn",
+        default=None,
         choices=["attn", "fixed_center"],
         help="attn=注意力质心细码；fixed_center=锁格子中心",
     )
-    p.add_argument(
-        "--cost-mode",
-        default="dense_terminal",
-        choices=["dense_terminal", "m_task_terminal"],
-    )
-    p.add_argument("--m-task-threshold", type=float, default=0.08)
-    p.add_argument("--m-task-mode", default="eps", choices=["eps", "topk", "mean"])
-    p.add_argument("--m-task-topk", type=int, default=4)
-    p.add_argument("--m-task-raw-pixels", action="store_true")
+    add_cost_cli_args(p)
 
     p.add_argument("--cem-num-samples", type=int, default=300)
     p.add_argument("--cem-n-steps", type=int, default=30)
     p.add_argument("--cem-topk", type=int, default=30)
     p.add_argument("--cem-var-scale", type=float, default=1.0)
+    p.add_argument("--plan-protocol", default="lewm", choices=PLAN_PROTOCOLS)
+    p.add_argument(
+        "--split",
+        default="dev",
+        choices=EVAL_SPLITS,
+        help="dev = odd eval episodes (tuning); test = even (final numbers only); all = both",
+    )
+    p.add_argument(
+        "--stats-dataset",
+        default=None,
+        help="h5 used to fit action/proprio normalizers; default: *_train.h5 next to --dataset",
+    )
     p.add_argument(
         "--plan-device",
         default="cuda",
@@ -722,7 +773,7 @@ def parse_args():
         help="CEM 规划设备",
     )
     p.add_argument("--plan-gpu", type=str, default=None, help="规划用物理 GPU，默认 EGL_GPU-1")
-    p.add_argument("--egl-gpu", type=str, default=None, help="Flex/EGL 用物理 GPU，默认环境变量或 5")
+    p.add_argument("--egl-gpu", type=str, default=None, help="Flex/EGL 用物理 GPU，默认环境变量或 1")
     p.add_argument("--plans-out", type=str, default=None, help="保存规划结果 pkl")
     p.add_argument("--plan-only", action="store_true", help="只规划并保存，不仿真")
     p.add_argument("--sim-from-plans", type=str, default=None, help="跳过规划，直接对已有 pkl 仿真")
@@ -803,7 +854,9 @@ def main():
     print(f"num_eval={args.num_eval} goal_offset={args.goal_offset} horizon={args.horizon}")
     print(f"history={args.history_size} action_dim={effective_act_dim} success_thr={args.success_threshold}")
 
-    process = build_processors(str(dataset_path), ("action", "proprio"))
+    stats_path = resolve_stats_path(dataset_path, args.stats_dataset)
+    print(f"[INFO] normalizer stats: {stats_path}  plan_protocol={args.plan_protocol}")
+    process = build_processors(stats_path, ("action", "proprio"))
     transform = {"pixels": img_transform(args.img_size), "goal": img_transform(args.img_size)}
 
     print("\n[INFO] Phase-1: 加载模型并 CEM 规划（无 PyFleX）...", flush=True)
@@ -835,9 +888,12 @@ def main():
         m_task_topk=args.m_task_topk,
         m_task_assume_normalized=not args.m_task_raw_pixels,
     )
+    apply_cost_attrs(model, args)
     if args.plan_device == "cuda" and not torch.cuda.is_available():
-        print("[WARN] CUDA 不可用，plan-device 改用 cpu")
-        args.plan_device = "cpu"
+        raise SystemExit(
+            f"CUDA unavailable (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}); "
+            "pass a valid --plan-gpu or --plan-device cpu explicitly"
+        )
     device = torch.device(args.plan_device)
     model = model.to(device)
     print(f"[INFO] plan device={device}", flush=True)
@@ -859,11 +915,14 @@ def main():
         cem_n_steps=args.cem_n_steps,
         cem_topk=args.cem_topk,
         cem_var_scale=args.cem_var_scale,
+        plan_protocol=args.plan_protocol,
+        split=args.split,
     )
     plan_time = time.time() - t0
     print(f"[INFO] 规划完成: {len(plans)} 条, {plan_time:.1f}s", flush=True)
 
-    plans_out = args.plans_out or str(ROOT / "outputs" / "rope_plans.pkl")
+    # Per-run default so concurrent evals never read each other's plans.
+    plans_out = args.plans_out or str(Path(args.output).with_suffix("")) + "_plans.pkl"
     Path(plans_out).parent.mkdir(parents=True, exist_ok=True)
     import pickle
 
@@ -888,6 +947,9 @@ def main():
     metrics.update(
         {
             "mode": "sim_two_process",
+            "plan_protocol": args.plan_protocol,
+            "split": args.split,
+            "stats_dataset": stats_path,
             "plan_device": args.plan_device,
             "plan_gpu": os.environ.get("PLAN_GPU"),
             "egl_gpu": os.environ.get("EGL_GPU"),

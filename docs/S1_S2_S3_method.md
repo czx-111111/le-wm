@@ -32,6 +32,7 @@
 
 | 阶段 | 改什么 | 不改什么 | 配置示例 |
 |------|--------|----------|----------|
+| **原版 CLS** | 1× CLS；规划 `dense_terminal` | — | `lewm_{wall,...}.yaml` |
 | **C1（对照）** | 4×4 avg pool → 16 token；评估 `M_task` | 训练 dense MSE | `lewm_*_c1.yaml` |
 | **S1** | CLS + 16 query 替换 avg pool | PE 仍为「加一次」learned；无辅助 CE | `lewm_*_s1.yaml` |
 | **S2（当前代码）** | 共享 4×4 NibblePE + 每层注入 + 动态 `n_lo`；相对偏置关闭 | 读出冻结为 S1；无辅助 CE | `lewm_*_s2.yaml` |
@@ -309,8 +310,18 @@ rope、同一 10 条 episode 上，双 nibble CE 两次都差于 §4.4 的 S2：
 
 ### 6.3 规划评估
 
-- Cost：`m_task_terminal`（阈值等与 C1 一致，便于公平对比）。
+- Cost：`m_task_terminal`（**C1 配置**；阈值等与 C1 一致。**不是** DINO-WM 的 visual objective；CLI 必须显式传入，脚本默认是 dense）。
 - 报告：成功率 / 距离指标，多 seed；**S1 必须同时报对 C1 与对 CLS**。
+- **四数据集正式协议、DINO vs C1 vs 当前推荐对照、已跑结果**见 [`docs/S1_S2_eval_protocol.md`](S1_S2_eval_protocol.md)（尤其 §0 / §0.1）。摘要：
+
+| 数据集 | frameskip | goal_offset | planner | 正式 MPC（C1/S1/S2） | 是否等于 DINO planner |
+|--------|-----------|-------------|---------|----------------------|----------------------|
+| wall | 5 | **25** | MPC | **2/10** | 否（DINO 为 5/∞） |
+| point_maze | 5 | **25** | MPC | **5/10** | 否（DINO `max_iter=null`） |
+| rope | 1 | **5** | **开环 CEM** | 无 | 无对应 plan yaml |
+| granular | 1 | **5** | **开环 CEM** | 无 | 无对应 plan yaml |
+
+wall / point 上 `goal_offset=5` 会因大量 early-success 虚高成功率，**不作主表**。
 
 ### 6.4 论文叙事（建议）
 
@@ -333,28 +344,31 @@ rope、同一 10 条 episode 上，双 nibble CE 两次都差于 §4.4 的 S2：
 
 | 内容 | 路径 |
 |------|------|
+| **原版 CLS** | `config/train/lewm_{wall,point_maze,rope,granular}.yaml`（无 `token_mode`/`plan` → 默认 cls + dense） |
 | Query 读出 / nibble 量化 / M_task | `jepa.py`（`SpatialQueryPool`, `nibble_codes_from_attn`, `compute_m_task_mask`） |
 | NibblePE / 预测器 | `module.py`（`NibblePE`, `ARPredictor`） |
-| 工厂 | `utils.py`（`build_lewm`） |
-| 损失 | `train.py`（`lejepa_forward`：dense MSE + SIGReg） |
+| 工厂 | `utils.py`（`build_lewm`；缺省 `token_mode=cls`，`cost_mode=dense_terminal`） |
+| 损失 / 训练入口 | `train.py`（`lejepa_forward`；`cfg.wm.get("token_mode","cls")`） |
 | C1 配置 | `config/train/lewm_*_c1.yaml` |
 | S1 配置 | `config/train/lewm_*_s1.yaml` |
 | S2 | `config/train/lewm_{wall,rope,granular,point_maze}_s2.yaml` |
 | 数据 | `config/train/data/{wall,point_maze,rope,granular}.yaml`；`STABLEWM_HOME/.../datasets/*_train.h5` |
+| 评估协议（原版 / C1 / DINO 对照） | [`docs/S1_S2_eval_protocol.md`](S1_S2_eval_protocol.md) §0.0–§0.1 |
 
 关键开关：
 
-| 键 | C1 | S1 | S2 |
-|----|----|----|-----|
-| `wm.pool_mode` | `avg` | `query` | `query` |
-| `wm.include_global_token` | false | true | true |
-| `wm.pos_mode` | learned | learned | **nibble** |
-| `wm.inject_every_layer` | false | false | **true** |
-| `wm.n_lo_mode` | — | — | **attn** |
-| `wm.use_relative_bias` | — | — | **false** |
-| `wm.abs_mode` | — | — | **shared** |
-| `loss.m_dyn` | 无 | 无 | 无 |
-| `plan.cost_mode` | `m_task_terminal` | 同左 | 同左 |
+| 键 | **原版 CLS** | C1 | S1 | S2 |
+|----|--------------|----|----|-----|
+| `wm.token_mode` | **`cls`**（缺省） | `spatial16` | `spatial16` | `spatial16` |
+| `wm.pool_mode` | — | `avg` | `query` | `query` |
+| `wm.include_global_token` | — | false | true | true |
+| `wm.pos_mode` | — | learned | learned | **nibble** |
+| `wm.inject_every_layer` | — | false | false | **true** |
+| `wm.n_lo_mode` | — | — | — | **attn** |
+| `wm.use_relative_bias` | — | — | — | **false** |
+| `wm.abs_mode` | — | — | — | **shared** |
+| `loss.m_dyn` | 无 | 无 | 无 | 无 |
+| `plan.cost_mode` | **`dense_terminal`**（缺省） | `m_task_terminal` | 同 C1 | 同 C1 |
 
 ---
 

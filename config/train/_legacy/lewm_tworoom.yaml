@@ -1,0 +1,76 @@
+# @package _global_
+# 原版 LeWM（CLS）tworoom：token_mode 缺省 cls，cost 缺省 dense_terminal
+defaults:
+  - _self_
+  - data: tworoom
+
+output_model_name: lewm_tworoom
+subdir: ${output_model_name}_${now:%Y%m%d_%H%M%S}
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+dump_object: True
+save_object_every_n_epochs: 5
+
+checkpoint:
+  monitor: validate/pred_loss
+  mode: min
+  save_top_k: 1
+
+trainer:
+  max_epochs: 50
+  devices: [0]
+  accelerator: gpu
+  strategy: auto
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5.0e-5
+  weight_decay: 1.0e-3
+
+wandb:
+  enabled: True
+  config:
+    entity: derorice_1-taiyuan-university-of-technology
+    project: le-wm-test
+    name: ${subdir}
+    id: ${subdir}
+    resume: never
+    log_model: False
+
+wm:
+  type: lewm
+  history_size: 3
+  num_preds: 1
+  embed_dim: 192
+  action_dim: 2
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024

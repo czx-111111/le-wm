@@ -158,6 +158,7 @@ def main():
     cds = []
     costs = []
     video_paths = []
+    details = []
     for i, plan in enumerate(plans):
         print(
             f"[sim-worker {i+1}/{len(plans)}] ep={plan['ep_id']} start={plan['start_step']}",
@@ -190,6 +191,8 @@ def main():
         successes.append(bool(ok))
         cds.append(cd)
         costs.append(float(plan["plan_cost"]))
+        details.append({"ep_id": int(plan["ep_id"]), "start_step": int(plan["start_step"]),
+                        "chamfer": float(cd), "success": bool(ok), "plan_cost": float(plan["plan_cost"])})
         print(f"  chamfer={cd:.6f} success={ok}", flush=True)
 
     cds_arr = np.asarray(cds, dtype=np.float64)
@@ -202,6 +205,7 @@ def main():
         "mean_planning_cost": float(np.mean(costs)) if costs else -1.0,
         "object_name": args.object_name,
     }
+    metrics["details"] = details
     if video_paths:
         metrics["videos"] = video_paths
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

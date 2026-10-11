@@ -1,0 +1,14 @@
+# @package _global_
+# 正式入口 r3 · granular · CLS
+# 训练: python train.py --config-name=r3/granular_cls
+# 权重: $STABLEWM_HOME/runs/r3/granular_cls_s<seed>_<时间戳>/
+defaults:
+  - /recipe/r3
+  - /method/cls
+  - /data: granular
+  - _self_
+
+output_model_name: granular_cls
+
+wm:
+  action_dim: 4

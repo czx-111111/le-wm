@@ -119,9 +119,39 @@ class ModelObjectCallBack(Callback):
             return float(value.item() if hasattr(value, "item") else value)
         return None
 
+    def _seed_best_score_from_trainer(self, trainer):
+        """After resume, restore best_score so a worse sanity-val cannot clobber best_object."""
+        if self.best_score is not None:
+            return
+        score_path = self.dirpath / f"{self.filename}_best_score.txt"
+        if score_path.is_file():
+            try:
+                self.best_score = float(score_path.read_text().strip())
+                print(
+                    f"[ModelObjectCallBack] seeded best_score={self.best_score:.6f} "
+                    f"from {score_path.name}"
+                )
+                return
+            except Exception:
+                pass
+        for cb in trainer.callbacks:
+            best = getattr(cb, "best_model_score", None)
+            if best is None:
+                continue
+            try:
+                self.best_score = float(best.item() if hasattr(best, "item") else best)
+                print(
+                    f"[ModelObjectCallBack] seeded best_score={self.best_score:.6f} "
+                    f"from {type(cb).__name__}"
+                )
+                return
+            except Exception:
+                continue
+
     def on_validation_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
             return
+        self._seed_best_score_from_trainer(trainer)
         score = self._read_score(trainer)
         if score is None:
             return
@@ -130,6 +160,11 @@ class ModelObjectCallBack(Callback):
         self.best_score = score
         best_path = self.dirpath / f"{self.filename}_best_object.ckpt"
         self._dump_model(pl_module.model, best_path)
+        score_path = self.dirpath / f"{self.filename}_best_score.txt"
+        try:
+            score_path.write_text(f"{score:.8f}\n")
+        except Exception:
+            pass
         print(
             f"[ModelObjectCallBack] saved best object "
             f"(epoch={trainer.current_epoch + 1}, {self.monitor}={score:.6f}) -> {best_path}"
@@ -145,6 +180,14 @@ class ModelObjectCallBack(Callback):
             return
         if epoch_1based % self.epoch_interval == 0 or epoch_1based == trainer.max_epochs:
             self._dump_model(pl_module.model, output_path)
+            # 训练结束再存一份固定名，正式评估用最后一轮（best 仍单独保留）
+            if epoch_1based == trainer.max_epochs:
+                last_path = self.dirpath / f"{self.filename}_last_object.ckpt"
+                self._dump_model(pl_module.model, last_path)
+                print(
+                    f"[ModelObjectCallBack] saved last object "
+                    f"(epoch={epoch_1based}) -> {last_path}"
+                )
 
     def _dump_model(self, model, path):
         try:
@@ -221,6 +264,16 @@ def build_lewm(
     n_lo_mode: str = "attn",
     use_relative_bias: bool = True,
     abs_mode: str = "shared",
+    locality: str = "none",
+    locality_sigma_init: float = 2.0,
+    locality_sigma_min: float = 1.0,
+    halo: int = 1,
+    fine_mode: str = "discrete",
+    softargmax_temp: float = 1.0,
+    fine_fourier_freqs: int = 8,
+    fine_conf_gate: bool = True,
+    pos_prop_enabled: bool = False,
+    pos_prop_weight: float = 0.01,
 ):
     """Construct a JEPA world model (CLS / C1 / S1 query / S2 NibblePE)."""
     import stable_pretraining as spt
@@ -266,6 +319,9 @@ def build_lewm(
         use_relative_bias=bool(use_relative_bias),
         abs_mode=str(abs_mode),
         spatial_grid=spatial_grid,
+        fine_mode=str(fine_mode),
+        fine_fourier_freqs=int(fine_fourier_freqs),
+        fine_conf_gate=bool(fine_conf_gate),
         **pred_kwargs,
     )
 
@@ -307,4 +363,14 @@ def build_lewm(
         n_lo_mode=str(n_lo_mode),
         encoder_hidden_dim=hidden_dim,
         embed_dim=embed_dim,
+        locality=str(locality),
+        locality_sigma_init=float(locality_sigma_init),
+        locality_sigma_min=float(locality_sigma_min),
+        halo=int(halo),
+        fine_mode=str(fine_mode),
+        softargmax_temp=float(softargmax_temp),
+        fine_fourier_freqs=int(fine_fourier_freqs),
+        fine_conf_gate=bool(fine_conf_gate),
+        pos_prop_enabled=bool(pos_prop_enabled),
+        pos_prop_weight=float(pos_prop_weight),
     )

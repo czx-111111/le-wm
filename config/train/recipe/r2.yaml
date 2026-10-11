@@ -1,0 +1,92 @@
+# @package _global_
+# 训练配方 r2（历史）：对齐官方 LeWM 超参，但 SIGReg 仍是展平多 token（会让 S2 坍缩）。
+# 正式训练请用 recipe/r3。仅作对照：python train.py --config-name=_legacy/lewm_rope_s2 +recipe=r2
+
+# 文件系统路径可含 /；wandb id/name 不能含 /:;#?/'
+run_name: ${output_model_name}_r2_s${seed}_${now:%Y%m%d_%H%M%S}
+subdir: runs/r2/${run_name}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+dump_object: true
+save_object_every_n_epochs: 10
+
+checkpoint:
+  monitor: validate/pred_loss
+  mode: min
+  save_top_k: 1
+
+trainer:
+  max_epochs: 100
+  devices: [0]
+  accelerator: gpu
+  strategy: auto
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  deterministic: true
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  persistent_workers: true
+  prefetch_factor: 2
+  pin_memory: true
+
+optimizer:
+  type: AdamW
+  lr: 5.0e-5
+  weight_decay: 1.0e-3
+
+loss:
+  # Stage-2 C2 defaults = current behavior (uniform MSE, flat SIGReg, 1-step TF).
+  token_balance:
+    mode: uniform  # uniform | group | group_varnorm
+    alpha: 0.5     # CLS weight when mode is group / group_varnorm
+    ema: 0.99      # target-variance EMA for group_varnorm
+  rollout_k: 1
+  rollout_weight: 1.0
+  sigreg:
+    weight: 0.09
+    fp32: false
+    per_token: false
+    grouped: false
+    cls_weight: 0.09
+    slot_weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+scheduler:
+  warmup_frac: 0.01
+
+wm:
+  type: lewm
+  history_size: 3
+  num_preds: 1
+  embed_dim: 192
+  encoder_grad_ckpt: true
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+wandb:
+  enabled: true
+  config:
+    entity: derorice_1-taiyuan-university-of-technology
+    project: le-wm-test
+    name: ${run_name}
+    id: ${run_name}
+    resume: allow
+    log_model: false

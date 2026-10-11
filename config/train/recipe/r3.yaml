@@ -1,0 +1,18 @@
+# @package _global_
+# 正式训练配方 r3（2026-09-30）。详见 docs/standard_r3.md。
+# 入口：python train.py --config-name=r3/<env>_<method>
+# 例如：r3/wall_s2、r3/rope_cls。无需再手动 +recipe=r3。
+defaults:
+  - /recipe/r2
+  - _self_
+
+run_name: ${output_model_name}_r3_s${seed}_${now:%Y%m%d_%H%M%S}
+subdir: runs/r3/${run_name}
+
+trainer:
+  deterministic: true
+
+loss:
+  sigreg:
+    # 多 token：逐 token SIGReg，堵住「跨帧恒定、跨 token 不同」坍缩捷径
+    per_token: true

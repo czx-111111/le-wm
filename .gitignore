@@ -7,7 +7,9 @@ data/
 
 # 日志和输出
 *.log
+*.out
 outputs/
+_archive/
 train.log
 eval.log
 
@@ -25,6 +27,10 @@ __pycache__/
 
 # 环境配置（含敏感信息）
 environment*.json
+.env
+.env.*
+!.env.example
+
 
 # 系统文件
 .DS_Store

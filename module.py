@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -8,7 +12,11 @@ def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 class SIGReg(torch.nn.Module):
-    """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
+    """Sketch Isotropic Gaussian Regularizer.
+
+    Under DDP, callers should all_gather the batch dim first so B is the global
+    batch; random projections are broadcast from rank 0 so every rank matches.
+    """
 
     def __init__(self, knots=17, num_proj=1024):
         super().__init__()
@@ -26,8 +34,10 @@ class SIGReg(torch.nn.Module):
         """
         proj: (T, B, D)
         """
-        # sample random projections
-        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        # sample random projections (same A on every DDP rank)
+        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device, dtype=proj.dtype)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(A, src=0)
         A = A.div_(A.norm(p=2, dim=0))
         # compute the epps-pulley statistic
         x_t = (proj @ A).unsqueeze(-1) * self.t
@@ -286,6 +296,9 @@ class NibblePE(nn.Module):
         abs_mode: str = "shared",
         use_fine: bool = True,
         use_relative_bias: bool = True,
+        fine_mode: str = "discrete",
+        fine_fourier_freqs: int = 8,
+        fine_conf_gate: bool = True,
     ):
         super().__init__()
         self.dim = int(dim)
@@ -293,6 +306,9 @@ class NibblePE(nn.Module):
         self.abs_mode = str(abs_mode)
         self.use_fine = bool(use_fine)
         self.use_relative_bias = bool(use_relative_bias)
+        self.fine_mode = str(fine_mode)
+        self.fine_fourier_freqs = int(fine_fourier_freqs)
+        self.fine_conf_gate = bool(fine_conf_gate)
         g = self.spatial_grid
         n = g * g
         self.include_global = bool(include_global)
@@ -306,6 +322,7 @@ class NibblePE(nn.Module):
             self.col_embed = None
             self.mlp_coarse = None
             self.mlp_fine = None
+            self.mlp_fine_cont = None
         else:
             self.slot_embed = None
             self.fine_embed = None
@@ -313,6 +330,11 @@ class NibblePE(nn.Module):
             self.col_embed = nn.Embedding(g, dim)
             self.mlp_coarse = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
             self.mlp_fine = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+            # continuous fine: Fourier(μ) → MLP
+            fdim = 4 * self.fine_fourier_freqs
+            self.mlp_fine_cont = nn.Sequential(
+                nn.Linear(fdim, dim), nn.GELU(), nn.Linear(dim, dim)
+            )
         rel = 2 * (g - 1) + 1
         self.rel_span = g - 1
         if self.use_relative_bias:
@@ -325,7 +347,28 @@ class NibblePE(nn.Module):
     def cell_embed(self, row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
         return self.row_embed(row) + self.col_embed(col)
 
-    def absolute(self, n_hi: torch.Tensor, n_lo: torch.Tensor) -> torch.Tensor:
+    def _fourier_xy(self, mu: torch.Tensor) -> torch.Tensor:
+        """mu: (..., 2) in [0, g) → Fourier features (..., 4*freqs)."""
+        g = float(self.spatial_grid)
+        freqs = int(getattr(self, "fine_fourier_freqs", 8))
+        # normalize to [0, 1]
+        xy = (mu / max(g - 1.0, 1.0)).clamp(0.0, 1.0)
+        device, dtype = mu.device, mu.dtype
+        k = torch.arange(1, freqs + 1, device=device, dtype=dtype).view(
+            *([1] * (mu.ndim - 1)), freqs
+        )
+        # (..., 2, freqs)
+        ang = xy.unsqueeze(-1) * k * (2.0 * math.pi)
+        return torch.cat([ang.sin(), ang.cos()], dim=-1).flatten(-2)
+
+    def absolute(
+        self,
+        n_hi: torch.Tensor,
+        n_lo: torch.Tensor,
+        mu: torch.Tensor | None = None,
+        conf: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        fine_mode = str(getattr(self, "fine_mode", "discrete"))
         if getattr(self, "abs_mode", "shared") == "slot":
             pe = self.slot_embed(n_hi)
             fine = getattr(self, "fine_embed", None)
@@ -334,10 +377,14 @@ class NibblePE(nn.Module):
             return pe
         g = self.spatial_grid
         row_h, col_h = n_hi // g, n_hi % g
+        coarse = self.mlp_coarse(self.cell_embed(row_h, col_h))
+        if fine_mode == "continuous" and mu is not None and getattr(self, "mlp_fine_cont", None) is not None:
+            fine = self.mlp_fine_cont(self._fourier_xy(mu.to(dtype=coarse.dtype)))
+            if bool(getattr(self, "fine_conf_gate", True)) and conf is not None:
+                fine = fine * conf.to(dtype=fine.dtype).unsqueeze(-1)
+            return coarse + fine
         row_l, col_l = n_lo // g, n_lo % g
-        return self.mlp_coarse(self.cell_embed(row_h, col_h)) + self.mlp_fine(
-            self.cell_embed(row_l, col_l)
-        )
+        return coarse + self.mlp_fine(self.cell_embed(row_l, col_l))
 
     def relative_bias(self, n_hi: torch.Tensor, n_lo: torch.Tensor, num_tokens: int):
         """Additive spatial bias (B, TN, TN). Global token (index 0) gets 0.
@@ -414,6 +461,9 @@ class ARPredictor(nn.Module):
         use_relative_bias: bool = True,
         abs_mode: str = "shared",
         spatial_grid: int = 4,
+        fine_mode: str = "discrete",
+        fine_fourier_freqs: int = 8,
+        fine_conf_gate: bool = True,
     ):
         super().__init__()
         self.num_frames = num_frames
@@ -425,6 +475,9 @@ class ARPredictor(nn.Module):
         self.use_relative_bias = bool(use_relative_bias)
         self.abs_mode = str(abs_mode)
         self.spatial_grid = int(spatial_grid)
+        self.fine_mode = str(fine_mode)
+        self.fine_fourier_freqs = int(fine_fourier_freqs)
+        self.fine_conf_gate = bool(fine_conf_gate)
         self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
         use_learned_spatial = self.num_spatial_tokens > 1 and self.pos_mode != "nibble"
         if use_learned_spatial:
@@ -442,6 +495,9 @@ class ARPredictor(nn.Module):
                 abs_mode=self.abs_mode,
                 use_fine=self.n_lo_mode == "attn",
                 use_relative_bias=self.use_relative_bias,
+                fine_mode=self.fine_mode,
+                fine_fourier_freqs=self.fine_fourier_freqs,
+                fine_conf_gate=self.fine_conf_gate,
             )
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
@@ -463,7 +519,7 @@ class ARPredictor(nn.Module):
         n_lo = torch.full((batch, time, slots), center, device=device, dtype=torch.long)
         return n_hi, n_lo
 
-    def forward(self, x, c, n_hi=None, n_lo=None):
+    def forward(self, x, c, n_hi=None, n_lo=None, mu=None, conf=None):
         """
         x: (B, T, d) or (B, T, N, d)
         c: (B, T, act_dim)
@@ -489,7 +545,9 @@ class ARPredictor(nn.Module):
                 # discrete codes are indices only; keep them off the autograd graph
                 n_hi = n_hi.long().detach()
                 n_lo = n_lo.long().detach()
-                pe_slots = nibble_pe.absolute(n_hi, n_lo)
+                mu_use = mu.detach() if mu is not None else None
+                conf_use = conf.detach() if conf is not None else None
+                pe_slots = nibble_pe.absolute(n_hi, n_lo, mu=mu_use, conf=conf_use)
                 if include_global:
                     gpe = nibble_pe.global_embed.expand(B, T, 1, D)
                     extra_pe = torch.cat([gpe, pe_slots], dim=2)

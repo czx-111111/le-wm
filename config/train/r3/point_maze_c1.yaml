@@ -1,0 +1,14 @@
+# @package _global_
+# 正式入口 r3 · point_maze · C1
+# 训练: python train.py --config-name=r3/point_maze_c1
+# 权重: $STABLEWM_HOME/runs/r3/point_maze_c1_s<seed>_<时间戳>/
+defaults:
+  - /recipe/r3
+  - /method/c1
+  - /data: point_maze
+  - _self_
+
+output_model_name: point_maze_c1
+
+wm:
+  action_dim: 2

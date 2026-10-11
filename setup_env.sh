@@ -15,24 +15,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   python fix_mujoco_py_cython.py
 if [ -d "$ROOT/mujoco210/mujoco210/bin" ]; then
   export MUJOCO_PY_MUJOCO_PATH="$ROOT/mujoco210/mujoco210"
-  export LD_LIBRARY_PATH="$ROOT/mujoco210/mujoco210/bin:${LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$ROOT/mujoco210/mujoco210/bin:${LD_LIBRARY_PATH:-}"
 elif [ -d "$ROOT/mujoco210/bin" ]; then
   export MUJOCO_PY_MUJOCO_PATH="$ROOT/mujoco210"
-  export LD_LIBRARY_PATH="$ROOT/mujoco210/bin:${LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$ROOT/mujoco210/bin:${LD_LIBRARY_PATH:-}"
 elif [ -d "$HOME/.mujoco/mujoco210/bin" ]; then
   export MUJOCO_PY_MUJOCO_PATH="$HOME/.mujoco/mujoco210"
-  export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH:-}"
 fi
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # 只加 /usr/lib/nvidia（EGL）；不要把 /usr/lib/x86_64-linux-gnu 插到前面，
 # 否则会盖住 venv 里 torch 自带的 libnvJitLink，导致 cusparse 符号错误。
-export LD_LIBRARY_PATH="/usr/lib/nvidia:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/usr/lib/nvidia:${LD_LIBRARY_PATH:-}"
 # 保证 torch 的 nvidia 轮子优先
 if [ -d "$ROOT/.venv/lib/python3.10/site-packages/nvidia" ]; then
   for _nv in nvjitlink cusparse cublas cudnn cufft curand cusolver cuda_runtime cuda_nvrtc nccl; do
     _d="$ROOT/.venv/lib/python3.10/site-packages/nvidia/${_nv}/lib"
     if [ -d "$_d" ]; then
-      export LD_LIBRARY_PATH="${_d}:${LD_LIBRARY_PATH}"
+      export LD_LIBRARY_PATH="${_d}:${LD_LIBRARY_PATH:-}"
     fi
   done
 fi
@@ -40,8 +40,8 @@ unset _nv _d
 
 # PyFleX 在 AdaptiGraph/PyFleX
 export PYFLEXROOT="$ROOT/AdaptiGraph/PyFleX"
-export PYTHONPATH="${PYFLEXROOT}/bindings/build:${PYTHONPATH}"
-export LD_LIBRARY_PATH="${PYFLEXROOT}/external/SDL2-2.0.4/lib/x64:${LD_LIBRARY_PATH}"
+export PYTHONPATH="${PYFLEXROOT}/bindings/build:${PYTHONPATH:-}"
+export LD_LIBRARY_PATH="${PYFLEXROOT}/external/SDL2-2.0.4/lib/x64:${LD_LIBRARY_PATH:-}"
 
 # Docker headless + NVIDIA EGL
 export PYFLEX_HEADLESS=1
@@ -78,7 +78,7 @@ if [ -x "$SYSROOT/usr/bin/patchelf" ]; then
 fi
 # PyFleX 的 CUDA9.2 cudart 已打进 RPATH；仅作兜底追加到末尾
 if [ -d "$DEPS_ROOT/cuda-9.2/lib64" ]; then
-  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$DEPS_ROOT/cuda-9.2/lib64"
+  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$DEPS_ROOT/cuda-9.2/lib64"
 fi
 
 # 避免 Mesa 抢 EGL

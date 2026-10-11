@@ -1,0 +1,14 @@
+# @package _global_
+# 正式入口 r3 · granular · S2
+# 训练: python train.py --config-name=r3/granular_s2
+# 权重: $STABLEWM_HOME/runs/r3/granular_s2_s<seed>_<时间戳>/
+defaults:
+  - /recipe/r3
+  - /method/s2
+  - /data: granular
+  - _self_
+
+output_model_name: granular_s2
+
+wm:
+  action_dim: 4

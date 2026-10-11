@@ -1,0 +1,9 @@
+# @package _global_
+# CLS：单全局 token（官方 LeWM）
+wm:
+  type: lewm
+  token_mode: cls
+  num_spatial_tokens: 1
+
+plan:
+  cost_mode: dense_terminal

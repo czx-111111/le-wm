@@ -1,8 +1,8 @@
 dataset:
+  _target_: stable_worldmodel.data.HDF5Dataset
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
   frameskip: 5
   name: tworoom
-  cache_dir: /mnt/data/wangjianfeng/qwh/czx/le-wm/data
   keys_to_load:
     - pixels
     - action
